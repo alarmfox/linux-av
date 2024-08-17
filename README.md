@@ -1,4 +1,4 @@
-# Summy - A Linux antivirus
+# Summy - A Linux malware detection program 
 **WARNING**: the following program is not production ready.
 
 A basic malware scanner written in Rust for desktop Linux users.
