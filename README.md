@@ -13,7 +13,7 @@ updates and communicates with clients through UNIX sockets.
 ## Goals
 * Implement some sort of real-time protection 
 * Introduce a kernel module to inspect both network traffic and programs using eBPF
+* Implement a sort of sandboxing through cgroups and Linux namespaces
 * Implement a systray and a GUI to control the application
-* Merge different signatures and rule sources
 
 
