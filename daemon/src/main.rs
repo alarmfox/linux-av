@@ -60,7 +60,7 @@ mod daemon {
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
     use tempfile::tempfile;
-    use yara::Compiler;
+    use yara::{Compiler, YaraError};
     use zip::ZipArchive;
 
     #[derive(Serialize, Deserialize)]
@@ -103,12 +103,10 @@ mod daemon {
 
     #[derive(Debug)]
     pub enum Error {
-        NetworkError { err: reqwest::Error },
-        IoError,
+        NetworkError(reqwest::Error),
+        IoError(io::Error),
         ZipError,
-        YaraError { reason: String },
-
-        InvalidRequest(serde_json::Error),
+        YaraError(yara::errors::Error),
     }
 
     #[derive(Debug)]
@@ -169,7 +167,7 @@ mod daemon {
                     let t1 = tokio::spawn(async {
                         let mut file = File::open(path1).unwrap();
                         let mut sha256 = Sha256::new();
-                        io::copy(&mut file, &mut sha256).map_err(|_| Error::IoError)?;
+                        io::copy(&mut file, &mut sha256).map_err(Error::IoError)?;
                         let hash = sha256.finalize();
                         let hash = format!("{:x}", hash);
 
@@ -182,7 +180,7 @@ mod daemon {
                     let (r1, r2) = tokio::join!(t1, t2);
                     let is_threat = r1.unwrap()?;
 
-                    let yr_result = r2.unwrap()?;
+                    let yr_result = r2.unwrap().map_err(Error::YaraError)?;
 
                     Ok(CommandResult::Scan(ScanResult {
                         threat: is_threat,
@@ -209,7 +207,7 @@ mod daemon {
         }
         fn scan_sig(self: Arc<Self>, hash: &str) -> Result<bool, Error> {
             let file = File::open(self.config_path.clone().join(MB_SHA256_FILE))
-                .map_err(|_| Error::IoError)?;
+                .map_err(Error::IoError)?;
 
             let reader = BufReader::new(file);
 
@@ -222,7 +220,7 @@ mod daemon {
             }
             Ok(false)
         }
-        fn yara_scan(self: Arc<Self>, target: PathBuf) -> Result<Vec<String>, Error> {
+        fn yara_scan(self: Arc<Self>, target: PathBuf) -> Result<Vec<String>, yara::errors::Error> {
             let yr_path = self
                 .config_path
                 .join(YR_CORE_FILE[0])
@@ -231,23 +229,11 @@ mod daemon {
 
             println!("{:?}", yr_path.to_str());
 
-            let compiler = Compiler::new()
-                .map_err(|e| Error::YaraError {
-                    reason: e.to_string(),
-                })?
-                .add_rules_file(yr_path)
-                .map_err(|e| Error::YaraError {
-                    reason: e.to_string(),
-                })?;
+            let compiler = Compiler::new()?.add_rules_file(yr_path)?;
 
-            let rules = compiler.compile_rules().map_err(|e| Error::YaraError {
-                reason: e.to_string(),
-            })?;
+            let rules = compiler.compile_rules()?;
             let result = rules
-                .scan_file(target, 60)
-                .map_err(|e| Error::YaraError {
-                    reason: e.to_string(),
-                })?
+                .scan_file(target, 60)?
                 .iter()
                 .map(|r| r.identifier.to_string())
                 .collect::<Vec<String>>();
@@ -257,17 +243,17 @@ mod daemon {
     }
 
     async fn download_and_extract(url: &str, dest_directory: PathBuf) -> Result<(), Error> {
-        let mut tempfile = tempfile().map_err(|_| Error::IoError)?;
+        let mut tempfile = tempfile().map_err(|e| Error::IoError(e))?;
         let response = reqwest::get(url)
             .await
-            .map_err(|err| Error::NetworkError { err })?
+            .map_err(Error::NetworkError)?
             .bytes()
             .await
-            .map_err(|err| Error::NetworkError { err })?;
+            .map_err(Error::NetworkError)?;
 
         let mut stream = Cursor::new(response);
 
-        io::copy(&mut stream, &mut tempfile);
+        let _ = io::copy(&mut stream, &mut tempfile).map_err(Error::IoError);
 
         ZipArchive::new(tempfile)
             .map_err(|_| Error::ZipError)?
