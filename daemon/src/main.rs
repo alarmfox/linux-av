@@ -29,6 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         0 => println!("Debug mode is off"),
         1 => println!("Debug mode is kind of on"),
         2 => println!("Debug mode is on"),
+        3 => println!("Tracing mode is on"),
         _ => println!("Don't be crazy"),
     }
 
@@ -49,7 +50,9 @@ mod daemon {
         "https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-core.zip";
 
     const YR_CORE_FILE: [&'static str; 3] = ["packages", "core", "yara-rules-core.yar"];
+
     use std::{
+        fmt::{self, Display},
         fs::File,
         io::{self, BufRead, BufReader, Cursor},
         os::unix::net::UnixListener,
@@ -64,11 +67,23 @@ mod daemon {
     use zip::ZipArchive;
 
     #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
     enum Command {
         Scan { path: PathBuf, offline: bool },
         Status,
         Update,
-        NoOp,
+    }
+
+    impl Display for Command {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Command::Scan { offline, .. } => {
+                    write!(f, "scan(path=***, offline={})", offline)
+                }
+                Command::Status => write!(f, "status"),
+                Command::Update => write!(f, "update"),
+            }
+        }
     }
 
     #[derive(Deserialize)]
@@ -92,13 +107,19 @@ mod daemon {
         version: String,
         rtp_on: bool,
     }
+    #[derive(Serialize)]
+    pub struct ErrorResult {
+        kind: String,
+        message: Option<String>,
+    }
 
     #[derive(Serialize)]
+    #[serde(rename_all = "snake_case")]
     pub enum CommandResult {
         Scan(ScanResult),
         Update(UpdateResult),
         Status(StatusResult),
-        NoOp,
+        Error(ErrorResult),
     }
 
     #[derive(Debug)]
@@ -107,6 +128,17 @@ mod daemon {
         IoError(io::Error),
         ZipError,
         YaraError(yara::errors::Error),
+    }
+
+    impl Display for Error {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Error::NetworkError(e) => write!(f, "Network error: {}", e),
+                Error::IoError(e) => write!(f, "IO error: {}", e),
+                Error::ZipError => write!(f, "Zip error"),
+                Error::YaraError(e) => write!(f, "Yara error: {}", e),
+            }
+        }
     }
 
     #[derive(Debug)]
@@ -136,15 +168,19 @@ mod daemon {
                 match listener.accept() {
                     Ok((socket, _)) => {
                         let mut request = serde_json::Deserializer::from_reader(&socket);
-                        // TODO: handle invalid requests
-                        let request = Request::deserialize(&mut request).unwrap_or_else(|e| {
-                            println!("request error: {:?}", e);
-                            Request {
-                                command: Command::NoOp,
-                            }
-                        });
-                        let response = me.clone().handle_request(&request).await.unwrap();
-
+                        let response = match Request::deserialize(&mut request) {
+                            Ok(request) => match me.clone().handle_request(&request).await {
+                                Ok(result) => result,
+                                Err(e) => CommandResult::Error(ErrorResult {
+                                    kind: format!("command {} returned an error", request.command),
+                                    message: Some(e.to_string()),
+                                }),
+                            },
+                            Err(e) => CommandResult::Error(ErrorResult {
+                                kind: "invalid request".to_string(),
+                                message: Some(e.to_string()),
+                            }),
+                        };
                         serde_json::to_writer(socket, &response).unwrap();
                     }
                     Err(e) => println!("accept function failed: {:?}", e),
@@ -158,7 +194,7 @@ mod daemon {
         ) -> Result<CommandResult, Error> {
             let me = self.clone();
             match &request.command {
-                Command::Scan { path, offline } => {
+                Command::Scan { path, .. } => {
                     if path.is_dir() {
                         todo!();
                     }
@@ -202,7 +238,6 @@ mod daemon {
                     rtp_on: self.rtp_on.clone(),
                     version: self.version.clone(),
                 })),
-                Command::NoOp => Ok(CommandResult::NoOp),
             }
         }
         fn scan_sig(self: Arc<Self>, hash: &str) -> Result<bool, Error> {
@@ -220,6 +255,7 @@ mod daemon {
             }
             Ok(false)
         }
+
         fn yara_scan(self: Arc<Self>, target: PathBuf) -> Result<Vec<String>, yara::errors::Error> {
             let yr_path = self
                 .config_path
@@ -253,7 +289,7 @@ mod daemon {
 
         let mut stream = Cursor::new(response);
 
-        let _ = io::copy(&mut stream, &mut tempfile).map_err(Error::IoError);
+        let _ = io::copy(&mut stream, &mut tempfile).map_err(Error::IoError)?;
 
         ZipArchive::new(tempfile)
             .map_err(|_| Error::ZipError)?
