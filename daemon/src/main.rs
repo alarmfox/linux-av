@@ -1,6 +1,6 @@
 use std::{fs, os::unix::net::UnixStream};
 
-use app::{Cli, ClientCommands, Command, DaemonCommands};
+use app::{Cli, Command, DaemonCommands, SimpleClientCommands};
 use clap::Parser;
 use common::CommandResult;
 use serde::Deserialize;
@@ -35,18 +35,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await?;
             }
         },
-        Command::Client(action) => {
+        Command::SimpleClient(action) => {
             let request = match action.command {
-                ClientCommands::Scan { path } => common::Request {
+                SimpleClientCommands::Scan { path } => common::Request {
                     command: common::Command::Scan {
                         path,
                         offline: true,
                     },
                 },
-                ClientCommands::Update => common::Request {
+                SimpleClientCommands::Update => common::Request {
                     command: common::Command::Update,
                 },
             };
+            let request = common::RequestType::Simple(request);
             let conn = UnixStream::connect(cli.socket_path)?;
             serde_json::to_writer(&conn, &request)?;
             let mut response = serde_json::Deserializer::from_reader(&conn);
@@ -78,9 +79,9 @@ mod daemon {
     use std::{
         fs::File,
         io::{self, BufRead, BufReader, Cursor},
-        os::unix::net::UnixListener,
+        os::unix::net::{SocketAddr, UnixListener, UnixStream},
         path::PathBuf,
-        sync::Arc,
+        sync::{Arc, Mutex, RwLock},
     };
 
     use serde::Deserialize;
@@ -91,7 +92,8 @@ mod daemon {
     use zip::ZipArchive;
 
     use crate::common::{
-        Command, CommandResult, Error, ErrorResult, Request, ScanResult, StatusResult, UpdateResult,
+        Command, CommandResult, Error, ErrorResult, Request, RequestType, ScanResult, StatusResult,
+        UpdateResult,
     };
 
     #[derive(Debug)]
@@ -101,6 +103,11 @@ mod daemon {
 
         unix_path: PathBuf,
         config_path: PathBuf,
+    }
+    #[derive(Debug)]
+    pub struct Client {
+        pub addr: SocketAddr,
+        pub connected_at: std::time::SystemTime,
     }
 
     impl Daemon {
@@ -124,15 +131,30 @@ mod daemon {
 
             loop {
                 match listener.accept() {
-                    Ok((socket, _)) => {
+                    Ok((socket, sa)) => {
                         let mut request = serde_json::Deserializer::from_reader(&socket);
-                        let response = match Request::deserialize(&mut request) {
-                            Ok(request) => match me.clone().handle_request(&request).await {
-                                Ok(result) => result,
-                                Err(e) => CommandResult::Error(ErrorResult {
-                                    kind: format!("command {} returned an error", request.command),
-                                    message: Some(e.to_string()),
-                                }),
+                        let response = match RequestType::deserialize(&mut request) {
+                            Ok(request_type) => match request_type {
+                                RequestType::Simple(request) => {
+                                    match me.clone().handle_simple_request(&request).await {
+                                        Ok(result) => result,
+                                        Err(e) => CommandResult::Error(ErrorResult {
+                                            kind: format!(
+                                                "command {} returned an error",
+                                                request.command
+                                            ),
+                                            message: Some(e.to_string()),
+                                        }),
+                                    }
+                                }
+                                RequestType::Persistent => {
+                                    match me.clone().handle_persistent_connection(socket, sa).await
+                                    {
+                                        Ok(_) => {}
+                                        Err(e) => error!("{:?}", e),
+                                    };
+                                    continue;
+                                }
                             },
                             Err(e) => CommandResult::Error(ErrorResult {
                                 kind: "invalid request".to_string(),
@@ -147,7 +169,7 @@ mod daemon {
         }
 
         #[tracing::instrument(skip(self), level = "trace", ret)]
-        pub async fn handle_request(
+        async fn handle_simple_request(
             self: Arc<Self>,
             request: &Request,
         ) -> Result<CommandResult, Error> {
@@ -197,6 +219,32 @@ mod daemon {
                     rtp_on: self.rtp_on.clone(),
                     version: self.version.clone(),
                 })),
+            }
+        }
+
+        #[tracing::instrument(skip(self), level = "trace")]
+        async fn handle_persistent_connection(
+            self: Arc<Self>,
+            socket: UnixStream,
+            peer: SocketAddr,
+        ) -> Result<(), Error> {
+            let me = self.clone();
+            loop {
+                let mut request = serde_json::Deserializer::from_reader(&socket);
+                let response = match Request::deserialize(&mut request) {
+                    Ok(request) => match me.clone().handle_simple_request(&request).await {
+                        Ok(result) => result,
+                        Err(e) => CommandResult::Error(ErrorResult {
+                            kind: format!("command {} returned an error", request.command),
+                            message: Some(e.to_string()),
+                        }),
+                    },
+                    Err(e) => CommandResult::Error(ErrorResult {
+                        kind: format!("bad request"),
+                        message: Some(e.to_string()),
+                    }),
+                };
+                serde_json::to_writer(&socket, &response).unwrap();
             }
         }
         fn scan_sig(self: Arc<Self>, hash: &str) -> Result<bool, Error> {
@@ -285,6 +333,12 @@ mod common {
             }
         }
     }
+    #[derive(Deserialize, Serialize, Debug)]
+    #[serde(rename_all = "snake_case")]
+    pub enum RequestType {
+        Simple(Request),
+        Persistent,
+    }
 
     #[derive(Deserialize, Serialize, Debug)]
     pub struct Request {
@@ -364,18 +418,18 @@ mod app {
 
     #[derive(Subcommand)]
     pub enum Command {
-        Client(Client),
+        SimpleClient(SimpleClient),
         Daemon(Daemon),
     }
 
     #[derive(Parser)]
-    pub struct Client {
+    pub struct SimpleClient {
         #[structopt(subcommand)]
-        pub command: ClientCommands,
+        pub command: SimpleClientCommands,
     }
 
     #[derive(Subcommand)]
-    pub enum ClientCommands {
+    pub enum SimpleClientCommands {
         Scan { path: PathBuf },
         Update,
     }
