@@ -1,42 +1,66 @@
-use std::{
-    fs::{self},
-    path::PathBuf,
-};
+use std::{fs, os::unix::net::UnixStream};
 
+use app::{Cli, ClientCommands, Command, DaemonCommands};
 use clap::Parser;
-
-#[derive(Parser)]
-#[command(version, about, long_about = None)]
-struct Cli {
-    /// Turn debugging information on
-    #[arg(short, action = clap::ArgAction::Count)]
-    verbose: u8,
-
-    #[arg(short, long, default_value = "/tmp/linux-av.sock")]
-    unix_socket: PathBuf,
-
-    #[arg(short, long, default_value = "/tmp/linux-av")]
-    config_dir: PathBuf,
-}
+use common::CommandResult;
+use serde::Deserialize;
+use tracing::{error, Level};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-
     // You can see how many times a particular flag or argument occurred
     // Note, only flags can have multiple occurrences
-    match cli.verbose {
-        0 => println!("Debug mode is off"),
-        1 => println!("Debug mode is kind of on"),
-        2 => println!("Debug mode is on"),
-        3 => println!("Tracing mode is on"),
-        _ => println!("Don't be crazy"),
-    }
+    let log_level = match cli.verbose {
+        0 => Level::ERROR,
+        1 => Level::INFO,
+        2 => Level::DEBUG,
+        _ => Level::TRACE,
+    };
+    // setup logging
+    // Set up the default subscriber
+    tracing_subscriber::fmt()
+        // all spans/events with a level higher than TRACE (e.g, info, warn, etc.)
+        // will be written to stdout.
+        .with_max_level(log_level)
+        // sets this to be the default, global collector for this application.
+        .init();
 
-    fs::create_dir_all(&cli.config_dir)?;
-    daemon::Daemon::new(cli.unix_socket, cli.config_dir)
-        .start()
-        .await?;
+    match cli.command {
+        Command::Daemon(action) => match action.command {
+            DaemonCommands::Start => {
+                fs::create_dir_all(cli.config_path.clone())?;
+                daemon::Daemon::new(cli.socket_path, cli.config_path)
+                    .start()
+                    .await?;
+            }
+        },
+        Command::Client(action) => {
+            let request = match action.command {
+                ClientCommands::Scan { path } => common::Request {
+                    command: common::Command::Scan {
+                        path,
+                        offline: true,
+                    },
+                },
+                ClientCommands::Update => common::Request {
+                    command: common::Command::Update,
+                },
+            };
+            let conn = UnixStream::connect(cli.socket_path)?;
+            serde_json::to_writer(&conn, &request)?;
+            let mut response = serde_json::Deserializer::from_reader(&conn);
+            match CommandResult::deserialize(&mut response) {
+                Ok(result) => {
+                    let a = serde_json::to_string(&result).unwrap();
+                    println!("{}", a);
+                }
+                Err(e) => {
+                    error!("{}", e.to_string());
+                }
+            }
+        }
+    };
 
     Ok(())
 }
@@ -52,7 +76,6 @@ mod daemon {
     const YR_CORE_FILE: [&'static str; 3] = ["packages", "core", "yara-rules-core.yar"];
 
     use std::{
-        fmt::{self, Display},
         fs::File,
         io::{self, BufRead, BufReader, Cursor},
         os::unix::net::UnixListener,
@@ -60,86 +83,16 @@ mod daemon {
         sync::Arc,
     };
 
-    use serde::{Deserialize, Serialize};
+    use serde::Deserialize;
     use sha2::{Digest, Sha256};
     use tempfile::tempfile;
-    use yara::{Compiler, YaraError};
+    use tracing::error;
+    use yara::Compiler;
     use zip::ZipArchive;
 
-    #[derive(Serialize, Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    enum Command {
-        Scan { path: PathBuf, offline: bool },
-        Status,
-        Update,
-    }
-
-    impl Display for Command {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match self {
-                Command::Scan { offline, .. } => {
-                    write!(f, "scan(path=***, offline={})", offline)
-                }
-                Command::Status => write!(f, "status"),
-                Command::Update => write!(f, "update"),
-            }
-        }
-    }
-
-    #[derive(Deserialize)]
-    pub struct Request {
-        command: Command,
-    }
-
-    #[derive(Serialize)]
-    pub struct UpdateResult {
-        status: i32,
-    }
-
-    #[derive(Serialize)]
-    pub struct ScanResult {
-        threat: bool,
-        intelligence: Option<Vec<String>>,
-    }
-
-    #[derive(Serialize)]
-    pub struct StatusResult {
-        version: String,
-        rtp_on: bool,
-    }
-    #[derive(Serialize)]
-    pub struct ErrorResult {
-        kind: String,
-        message: Option<String>,
-    }
-
-    #[derive(Serialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum CommandResult {
-        Scan(ScanResult),
-        Update(UpdateResult),
-        Status(StatusResult),
-        Error(ErrorResult),
-    }
-
-    #[derive(Debug)]
-    pub enum Error {
-        NetworkError(reqwest::Error),
-        IoError(io::Error),
-        ZipError,
-        YaraError(yara::errors::Error),
-    }
-
-    impl Display for Error {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match self {
-                Error::NetworkError(e) => write!(f, "Network error: {}", e),
-                Error::IoError(e) => write!(f, "IO error: {}", e),
-                Error::ZipError => write!(f, "Zip error"),
-                Error::YaraError(e) => write!(f, "Yara error: {}", e),
-            }
-        }
-    }
+    use crate::common::{
+        Command, CommandResult, Error, ErrorResult, Request, ScanResult, StatusResult, UpdateResult,
+    };
 
     #[derive(Debug)]
     pub struct Daemon {
@@ -164,6 +117,11 @@ mod daemon {
             let listener = UnixListener::bind(self.unix_path.clone())?;
             let me = Arc::new(self);
 
+            let t1 = tokio::spawn(download_and_extract(MB_SHA256_URL, me.config_path.clone()));
+            let t2 = tokio::spawn(download_and_extract(YR_CORE_URL, me.config_path.clone()));
+
+            let (r1, r2) = tokio::join!(t1, t2);
+
             loop {
                 match listener.accept() {
                     Ok((socket, _)) => {
@@ -183,11 +141,12 @@ mod daemon {
                         };
                         serde_json::to_writer(socket, &response).unwrap();
                     }
-                    Err(e) => println!("accept function failed: {:?}", e),
+                    Err(e) => error!("accept function failed: {:?}", e),
                 }
             }
         }
 
+        #[tracing::instrument(skip(self), level = "trace", ret)]
         pub async fn handle_request(
             self: Arc<Self>,
             request: &Request,
@@ -263,8 +222,6 @@ mod daemon {
                 .join(YR_CORE_FILE[1])
                 .join(YR_CORE_FILE[2]);
 
-            println!("{:?}", yr_path.to_str());
-
             let compiler = Compiler::new()?.add_rules_file(yr_path)?;
 
             let rules = compiler.compile_rules()?;
@@ -297,5 +254,139 @@ mod daemon {
             .map_err(|_| Error::ZipError)?;
 
         Ok(())
+    }
+}
+
+mod common {
+    use std::{
+        fmt::{self, Display},
+        io,
+        path::PathBuf,
+    };
+
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, Debug)]
+    #[serde(rename_all = "snake_case")]
+    pub enum Command {
+        Scan { path: PathBuf, offline: bool },
+        Status,
+        Update,
+    }
+
+    impl Display for Command {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Command::Scan { offline, path } => {
+                    write!(f, "scan(path={:?}, offline={})", path, offline)
+                }
+                Command::Status => write!(f, "status"),
+                Command::Update => write!(f, "update"),
+            }
+        }
+    }
+
+    #[derive(Deserialize, Serialize, Debug)]
+    pub struct Request {
+        pub command: Command,
+    }
+
+    #[derive(Serialize, Deserialize, Debug)]
+    pub struct UpdateResult {
+        pub status: i32,
+    }
+
+    #[derive(Serialize, Deserialize, Debug)]
+    pub struct ScanResult {
+        pub threat: bool,
+        pub intelligence: Option<Vec<String>>,
+    }
+
+    #[derive(Serialize, Deserialize, Debug)]
+    pub struct StatusResult {
+        pub version: String,
+        pub rtp_on: bool,
+    }
+    #[derive(Serialize, Deserialize, Debug)]
+    pub struct ErrorResult {
+        pub kind: String,
+        pub message: Option<String>,
+    }
+
+    #[derive(Serialize, Deserialize, Debug)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CommandResult {
+        Scan(ScanResult),
+        Update(UpdateResult),
+        Status(StatusResult),
+        Error(ErrorResult),
+    }
+
+    #[derive(Debug)]
+    pub enum Error {
+        NetworkError(reqwest::Error),
+        IoError(io::Error),
+        ZipError,
+        YaraError(yara::errors::Error),
+    }
+
+    impl Display for Error {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Error::NetworkError(e) => write!(f, "Network error: {}", e),
+                Error::IoError(e) => write!(f, "IO error: {}", e),
+                Error::ZipError => write!(f, "Zip error"),
+                Error::YaraError(e) => write!(f, "Yara error: {}", e),
+            }
+        }
+    }
+}
+mod app {
+    use clap::{Parser, Subcommand};
+    use std::path::PathBuf;
+
+    #[derive(Parser)]
+    #[command(version, about, long_about = None)]
+    pub struct Cli {
+        /// Turn debugging information on
+        #[arg(short, action = clap::ArgAction::Count)]
+        pub verbose: u8,
+
+        #[arg(short, long, default_value = "/tmp/linux-av.sock")]
+        pub socket_path: PathBuf,
+
+        #[arg(short, long, default_value = "/tmp/linux-av")]
+        pub config_path: PathBuf,
+
+        #[command(subcommand)]
+        pub command: Command,
+    }
+
+    #[derive(Subcommand)]
+    pub enum Command {
+        Client(Client),
+        Daemon(Daemon),
+    }
+
+    #[derive(Parser)]
+    pub struct Client {
+        #[structopt(subcommand)]
+        pub command: ClientCommands,
+    }
+
+    #[derive(Subcommand)]
+    pub enum ClientCommands {
+        Scan { path: PathBuf },
+        Update,
+    }
+    #[derive(Parser)]
+    pub struct Daemon {
+        #[structopt(subcommand)]
+        pub command: DaemonCommands,
+    }
+
+    #[derive(Subcommand)]
+    pub enum DaemonCommands {
+        Start,
     }
 }
