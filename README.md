@@ -12,5 +12,8 @@ updates and communicates with clients through UNIX sockets.
 - [x] Signature based scanning (importing a database)
 - [x] Rule based scanning (using yara rules)
 - [ ] Sandboxing
+- [ ] Concurrent server
+- [ ] Support persistent connections with live updates
 
-@@include[Ideas](./IDEA.md)@@
+
+

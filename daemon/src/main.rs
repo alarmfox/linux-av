@@ -4,7 +4,7 @@ use app::{Cli, Command, DaemonCommands, SimpleClientCommands};
 use clap::Parser;
 use common::CommandResult;
 use serde::Deserialize;
-use tracing::{error, Level};
+use tracing::{error, info, Level};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,6 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Daemon(action) => match action.command {
             DaemonCommands::Start => {
+                info!("starting");
                 fs::create_dir_all(cli.config_path.clone())?;
                 daemon::Daemon::new(cli.socket_path, cli.config_path)
                     .start()
@@ -45,6 +46,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 SimpleClientCommands::Update => common::Request {
                     command: common::Command::Update,
+                },
+                SimpleClientCommands::Run {
+                    path,
+                    timeout_seconds,
+                    args,
+                } => common::Request {
+                    command: common::Command::Run {
+                        path,
+                        timeout_seconds,
+                        args,
+                    },
                 },
             };
             let request = common::RequestType::Simple(request);
@@ -77,23 +89,30 @@ mod daemon {
     const YR_CORE_FILE: [&'static str; 3] = ["packages", "core", "yara-rules-core.yar"];
 
     use std::{
+        ffi::CString,
         fs::File,
         io::{self, BufRead, BufReader, Cursor},
         os::unix::net::{SocketAddr, UnixListener, UnixStream},
         path::PathBuf,
-        sync::{Arc, Mutex, RwLock},
+        sync::Arc,
     };
 
+    use nix::{
+        mount::{mount, MsFlags},
+        sched::{clone, CloneFlags},
+        sys::wait::{waitpid, WaitStatus},
+        unistd::execvp,
+    };
     use serde::Deserialize;
     use sha2::{Digest, Sha256};
     use tempfile::tempfile;
-    use tracing::error;
+    use tracing::{error, trace};
     use yara::Compiler;
     use zip::ZipArchive;
 
     use crate::common::{
-        Command, CommandResult, Error, ErrorResult, Request, RequestType, ScanResult, StatusResult,
-        UpdateResult,
+        Command, CommandResult, Error, ErrorResult, Request, RequestType, RunResult, ScanResult,
+        StatusResult, UpdateResult,
     };
 
     #[derive(Debug)]
@@ -219,6 +238,14 @@ mod daemon {
                     rtp_on: self.rtp_on.clone(),
                     version: self.version.clone(),
                 })),
+                Command::Run {
+                    path,
+                    timeout_seconds,
+                    args,
+                } => {
+                    trace!("running in sandboxed enviroment");
+                    Ok(CommandResult::Run(RunResult { status: 0 }))
+                }
             }
         }
 
@@ -247,6 +274,67 @@ mod daemon {
                 serde_json::to_writer(&socket, &response).unwrap();
             }
         }
+
+        fn run_in_sandbox(self: Arc<Self>, path: &PathBuf) -> Result<(), Error> {
+            let stack_size = 1024 * 1024;
+            let mut stack: Vec<u8> = vec![0; stack_size];
+
+            let clone_flags = CloneFlags::CLONE_NEWNS; // Crea un nuovo mount namespace
+
+            let child_pid = clone(
+                Box::new(|| {
+                    // Questo codice verrà eseguito nel processo figlio
+
+                    // Monta un filesystem specifico o modifica i mount point
+                    // Ad esempio, rimonta la root in modalità read-only
+                    if let Err(e) = mount(
+                        Some("/"),
+                        "/",
+                        Some(""),
+                        MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+                        None::<&str>,
+                    ) {
+                        eprintln!("Errore nel montare il filesystem: {:?}", e);
+                        return -1;
+                    }
+
+                    // Prepara il programma e gli argomenti da eseguire
+                    let c_program = CString::new(path.to_str().unwrap())
+                        .expect("Errore nella conversione del programma");
+
+                    // Esegui il programma specificato
+                    let args: Vec<CString> = vec![];
+                    match execvp(&c_program, &args) {
+                        Ok(_) => 0,
+                        Err(err) => {
+                            eprintln!("Errore nell'eseguire il programma: {:?}", err);
+                            -1
+                        }
+                    }
+                }),
+                &mut stack,
+                clone_flags,
+                None,
+            )
+            .unwrap();
+
+            // Aspetta che il processo figlio termini
+            match waitpid(child_pid, None).unwrap() {
+                WaitStatus::Exited(_, status) => {
+                    println!("Il processo figlio è terminato con stato: {}", status);
+                    Ok(())
+                }
+                WaitStatus::Signaled(_, signal, _) => {
+                    println!("Il processo figlio è terminato per segnale: {}", signal);
+                    Ok(())
+                }
+                _ => {
+                    eprintln!("Il processo figlio è terminato in modo inatteso");
+                    Ok(())
+                }
+            }
+        }
+
         fn scan_sig(self: Arc<Self>, hash: &str) -> Result<bool, Error> {
             let file = File::open(self.config_path.clone().join(MB_SHA256_FILE))
                 .map_err(Error::IoError)?;
@@ -317,9 +405,17 @@ mod common {
     #[derive(Serialize, Deserialize, Debug)]
     #[serde(rename_all = "snake_case")]
     pub enum Command {
-        Scan { path: PathBuf, offline: bool },
+        Scan {
+            path: PathBuf,
+            offline: bool,
+        },
         Status,
         Update,
+        Run {
+            path: PathBuf,
+            timeout_seconds: Option<u64>,
+            args: Option<Vec<String>>,
+        },
     }
 
     impl Display for Command {
@@ -330,6 +426,15 @@ mod common {
                 }
                 Command::Status => write!(f, "status"),
                 Command::Update => write!(f, "update"),
+                Command::Run {
+                    path,
+                    timeout_seconds,
+                    args,
+                } => write!(
+                    f,
+                    "run(path={:?}, timeout={:?}, args={:?})",
+                    path, timeout_seconds, args
+                ),
             }
         }
     }
@@ -362,6 +467,10 @@ mod common {
         pub rtp_on: bool,
     }
     #[derive(Serialize, Deserialize, Debug)]
+    pub struct RunResult {
+        pub status: i32,
+    }
+    #[derive(Serialize, Deserialize, Debug)]
     pub struct ErrorResult {
         pub kind: String,
         pub message: Option<String>,
@@ -373,6 +482,7 @@ mod common {
         Scan(ScanResult),
         Update(UpdateResult),
         Status(StatusResult),
+        Run(RunResult),
         Error(ErrorResult),
     }
 
@@ -430,8 +540,15 @@ mod app {
 
     #[derive(Subcommand)]
     pub enum SimpleClientCommands {
-        Scan { path: PathBuf },
+        Scan {
+            path: PathBuf,
+        },
         Update,
+        Run {
+            path: PathBuf,
+            timeout_seconds: Option<u64>,
+            args: Option<Vec<String>>,
+        },
     }
     #[derive(Parser)]
     pub struct Daemon {
