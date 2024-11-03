@@ -9,11 +9,8 @@ updates and communicates with clients through UNIX sockets.
 
 ## Features
 
-- [ ] Signature based scanning (importing a database)
-- [ ] Rule based scanning (using sigma rules)
+- [x] Signature based scanning (importing a database)
+- [x] Rule based scanning (using yara rules)
+- [ ] Sandboxing
 
-## Goals
-
-- Introduce a kernel module to inspect system call using eBPF
-- Implement a systray and a GUI to control the application
-- Merge different signatures and rule sources
+@@include[Ideas](./IDEA.md)@@
