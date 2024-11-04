@@ -1,4 +1,4 @@
-# Summy - A Linux malware detection program
+# linux-av: A Linux malware detection program
 
 **WARNING**: the following program is not production ready.
 
