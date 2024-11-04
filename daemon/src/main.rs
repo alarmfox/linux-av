@@ -44,16 +44,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 SimpleClientCommands::Update => common::Request {
                     command: common::Command::Update,
                 },
-                SimpleClientCommands::Run {
-                    path,
-                    timeout_seconds,
-                    args,
-                } => common::Request {
-                    command: common::Command::Run {
-                        path,
-                        timeout_seconds,
-                        args,
-                    },
+                SimpleClientCommands::Run { path, args } => common::Request {
+                    command: common::Command::Run { path, args },
                 },
             };
             let request = common::RequestType::Simple(request);
@@ -81,6 +73,7 @@ mod daemon {
     const VERSION: &str = "v0.1-alpha";
 
     const SOCKET_PATH: &str = "linux-av.sock";
+    const PIDFILE_PATH: &str = "daemon.pid";
 
     const YR_CORE_URL: &str =
         "https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-core.zip";
@@ -91,19 +84,20 @@ mod daemon {
         ffi::CString,
         fs::{self, File},
         io::{self, BufRead, BufReader, Cursor},
-        os::unix::net::{SocketAddr, UnixListener, UnixStream},
+        os::unix::{
+            fs::PermissionsExt,
+            net::{SocketAddr, UnixListener, UnixStream},
+        },
         path::PathBuf,
+        process,
         sync::Arc,
     };
 
     use nix::{
         mount::{mount, MsFlags},
         sched::{clone, CloneFlags},
-        sys::{
-            signal::Signal::SIGCHLD,
-            wait::{waitpid, WaitStatus},
-        },
-        unistd::{execvp, setuid, Uid},
+        sys::wait::{waitpid, WaitStatus},
+        unistd::execvp,
     };
     use serde::Deserialize;
     use sha2::{Digest, Sha256};
@@ -139,6 +133,10 @@ mod daemon {
                     _ => Err(e),
                 },
             }?;
+
+            let pid = process::id();
+            fs::write(config_path.join(PIDFILE_PATH), pid.to_string())?;
+
             Ok(Self {
                 version: VERSION.to_string(),
                 rtp_on: false,
@@ -150,6 +148,11 @@ mod daemon {
         pub async fn start(self: Self) -> Result<(), Box<dyn std::error::Error>> {
             let listener = UnixListener::bind(self.socket_path.clone())?;
             let me = Arc::new(self);
+
+            fs::set_permissions(
+                me.clone().socket_path.clone(),
+                fs::Permissions::from_mode(0o777),
+            )?;
 
             loop {
                 match listener.accept() {
@@ -241,11 +244,7 @@ mod daemon {
                     rtp_on: self.rtp_on.clone(),
                     version: self.version.clone(),
                 })),
-                Command::Run {
-                    path,
-                    timeout_seconds,
-                    args,
-                } => {
+                Command::Run { path, args } => {
                     let run_result = match me.clone().run_in_sandbox(path, args.clone()) {
                         Ok(()) => RunResult { status: 0 },
                         Err(e) => {
@@ -292,27 +291,11 @@ mod daemon {
             let stack_size = 1024 * 1024;
             let mut stack: Vec<u8> = vec![0; stack_size];
 
-            // Temporarily gain root privileges
-            let root_uid = Uid::from_raw(0);
-            setuid(root_uid).expect("Failed to gain root privileges");
-
             let clone_flags =
                 CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWNS;
 
             let child_pid = clone(
                 Box::new(|| {
-                    // Set up a new mount namespace
-                    // if let Err(e) = mount(
-                    //     Some("none"),
-                    //     "/",
-                    //     Some(""),
-                    //     MsFlags::MS_REC | MsFlags::MS_PRIVATE,
-                    //     None::<&str>,
-                    // ) {
-                    //     error!("Error setting up mount namespace: {:?}", e);
-                    //     return -1;
-                    // }
-                    //
                     // Mount a temporary filesystem
                     if let Err(e) = mount(
                         Some("tmpfs"),
@@ -330,8 +313,15 @@ mod daemon {
                         .expect("Error converting program path");
 
                     // Execute the specified program
-                    let args: Vec<CString> = vec![];
-                    match execvp(&c_program, &args) {
+                    let mut args = match &args {
+                        Some(args) => args
+                            .split_whitespace()
+                            .map(|s| CString::new(s).unwrap())
+                            .collect(),
+                        None => vec![],
+                    };
+                    args.insert(0, c_program);
+                    match execvp(&args[0], &args) {
                         Ok(_) => 0,
                         Err(err) => {
                             error!("Error executing program: {:?}", err);
@@ -341,12 +331,9 @@ mod daemon {
                 }),
                 &mut stack,
                 clone_flags,
-                Some(17),
+                Some(nix::libc::SIGCHLD),
             )
             .unwrap();
-
-            let non_root_uid = Uid::from_raw(1000);
-            setuid(non_root_uid).expect("Failed to drop root privileges");
 
             // Aspetta che il processo figlio termini
             match waitpid(child_pid, None).unwrap() {
@@ -435,17 +422,10 @@ mod common {
     #[derive(Serialize, Deserialize, Debug)]
     #[serde(rename_all = "snake_case")]
     pub enum Command {
-        Scan {
-            path: PathBuf,
-            offline: bool,
-        },
+        Scan { path: PathBuf, offline: bool },
         Status,
         Update,
-        Run {
-            path: PathBuf,
-            timeout_seconds: Option<u64>,
-            args: Option<String>,
-        },
+        Run { path: PathBuf, args: Option<String> },
     }
 
     impl Display for Command {
@@ -456,15 +436,9 @@ mod common {
                 }
                 Command::Status => write!(f, "status"),
                 Command::Update => write!(f, "update"),
-                Command::Run {
-                    path,
-                    timeout_seconds,
-                    args,
-                } => write!(
-                    f,
-                    "run(path={:?}, timeout={:?}, args={:?})",
-                    path, timeout_seconds, args
-                ),
+                Command::Run { path, args } => {
+                    write!(f, "run(path={:?}, args={:?})", path, args)
+                }
             }
         }
     }
@@ -576,7 +550,7 @@ mod app {
         Update,
         Run {
             path: PathBuf,
-            timeout_seconds: Option<u64>,
+            #[arg(long)]
             args: Option<String>,
         },
     }
