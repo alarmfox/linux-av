@@ -4,7 +4,8 @@ use app::{Cli, Command, DaemonCommands, SimpleClientCommands};
 use clap::Parser;
 use common::CommandResult;
 use serde::Deserialize;
-use tracing::{error, info, Level};
+use tracing::error;
+use tracing::Level;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,11 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Daemon(action) => match action.command {
             DaemonCommands::Start => {
-                info!("starting");
-                fs::create_dir_all(cli.config_path.clone())?;
-                daemon::Daemon::new(cli.socket_path, cli.config_path)
-                    .start()
-                    .await?;
+                daemon::Daemon::new(cli.config_path)?.start().await?;
             }
         },
         Command::SimpleClient(action) => {
@@ -60,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             };
             let request = common::RequestType::Simple(request);
-            let conn = UnixStream::connect(cli.socket_path)?;
+            let conn = UnixStream::connect(action.socket_path)?;
             serde_json::to_writer(&conn, &request)?;
             let mut response = serde_json::Deserializer::from_reader(&conn);
             match CommandResult::deserialize(&mut response) {
@@ -83,6 +80,8 @@ mod daemon {
     const MB_SHA256_FILE: &str = "full_sha256.txt";
     const VERSION: &str = "v0.1-alpha";
 
+    const SOCKET_PATH: &str = "linux-av.sock";
+
     const YR_CORE_URL: &str =
         "https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-core.zip";
 
@@ -90,7 +89,7 @@ mod daemon {
 
     use std::{
         ffi::CString,
-        fs::File,
+        fs::{self, File},
         io::{self, BufRead, BufReader, Cursor},
         os::unix::net::{SocketAddr, UnixListener, UnixStream},
         path::PathBuf,
@@ -100,13 +99,16 @@ mod daemon {
     use nix::{
         mount::{mount, MsFlags},
         sched::{clone, CloneFlags},
-        sys::wait::{waitpid, WaitStatus},
-        unistd::execvp,
+        sys::{
+            signal::Signal::SIGCHLD,
+            wait::{waitpid, WaitStatus},
+        },
+        unistd::{execvp, setuid, Uid},
     };
     use serde::Deserialize;
     use sha2::{Digest, Sha256};
     use tempfile::tempfile;
-    use tracing::{error, trace};
+    use tracing::{debug, error};
     use yara::Compiler;
     use zip::ZipArchive;
 
@@ -120,33 +122,34 @@ mod daemon {
         version: String,
         rtp_on: bool,
 
-        unix_path: PathBuf,
+        socket_path: PathBuf,
         config_path: PathBuf,
     }
-    #[derive(Debug)]
-    pub struct Client {
-        pub addr: SocketAddr,
-        pub connected_at: std::time::SystemTime,
-    }
-
     impl Daemon {
-        pub fn new(unix_path: PathBuf, config_path: PathBuf) -> Self {
-            Self {
+        pub fn new(config_path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+            fs::create_dir_all(config_path.clone())?;
+            let socket_path = config_path.join(SOCKET_PATH);
+            match fs::remove_file(socket_path.clone()) {
+                Ok(()) => {
+                    debug!("deleted old file {:?}", socket_path.clone());
+                    Ok(())
+                }
+                Err(e) => match e.kind() {
+                    std::io::ErrorKind::NotFound => Ok(()),
+                    _ => Err(e),
+                },
+            }?;
+            Ok(Self {
                 version: VERSION.to_string(),
                 rtp_on: false,
-                unix_path,
                 config_path,
-            }
+                socket_path,
+            })
         }
 
         pub async fn start(self: Self) -> Result<(), Box<dyn std::error::Error>> {
-            let listener = UnixListener::bind(self.unix_path.clone())?;
+            let listener = UnixListener::bind(self.socket_path.clone())?;
             let me = Arc::new(self);
-
-            let t1 = tokio::spawn(download_and_extract(MB_SHA256_URL, me.config_path.clone()));
-            let t2 = tokio::spawn(download_and_extract(YR_CORE_URL, me.config_path.clone()));
-
-            let (r1, r2) = tokio::join!(t1, t2);
 
             loop {
                 match listener.accept() {
@@ -243,8 +246,14 @@ mod daemon {
                     timeout_seconds,
                     args,
                 } => {
-                    trace!("running in sandboxed enviroment");
-                    Ok(CommandResult::Run(RunResult { status: 0 }))
+                    let run_result = match me.clone().run_in_sandbox(path, args.clone()) {
+                        Ok(()) => RunResult { status: 0 },
+                        Err(e) => {
+                            error!("{:?}", e);
+                            RunResult { status: 1 }
+                        }
+                    };
+                    Ok(CommandResult::Run(run_result))
                 }
             }
         }
@@ -275,48 +284,69 @@ mod daemon {
             }
         }
 
-        fn run_in_sandbox(self: Arc<Self>, path: &PathBuf) -> Result<(), Error> {
+        fn run_in_sandbox(
+            self: Arc<Self>,
+            path: &PathBuf,
+            args: Option<String>,
+        ) -> Result<(), Error> {
             let stack_size = 1024 * 1024;
             let mut stack: Vec<u8> = vec![0; stack_size];
 
-            let clone_flags = CloneFlags::CLONE_NEWNS; // Crea un nuovo mount namespace
+            // Temporarily gain root privileges
+            let root_uid = Uid::from_raw(0);
+            setuid(root_uid).expect("Failed to gain root privileges");
+
+            let clone_flags =
+                CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWNS;
 
             let child_pid = clone(
                 Box::new(|| {
-                    // Questo codice verrà eseguito nel processo figlio
-
-                    // Monta un filesystem specifico o modifica i mount point
-                    // Ad esempio, rimonta la root in modalità read-only
+                    // Set up a new mount namespace
+                    // if let Err(e) = mount(
+                    //     Some("none"),
+                    //     "/",
+                    //     Some(""),
+                    //     MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+                    //     None::<&str>,
+                    // ) {
+                    //     error!("Error setting up mount namespace: {:?}", e);
+                    //     return -1;
+                    // }
+                    //
+                    // Mount a temporary filesystem
                     if let Err(e) = mount(
-                        Some("/"),
-                        "/",
-                        Some(""),
-                        MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+                        Some("tmpfs"),
+                        "/tmp",
+                        Some("tmpfs"),
+                        MsFlags::empty(),
                         None::<&str>,
                     ) {
-                        eprintln!("Errore nel montare il filesystem: {:?}", e);
+                        error!("Error mounting tmpfs: {:?}", e);
                         return -1;
                     }
 
-                    // Prepara il programma e gli argomenti da eseguire
+                    // Prepare the program and arguments to execute
                     let c_program = CString::new(path.to_str().unwrap())
-                        .expect("Errore nella conversione del programma");
+                        .expect("Error converting program path");
 
-                    // Esegui il programma specificato
+                    // Execute the specified program
                     let args: Vec<CString> = vec![];
                     match execvp(&c_program, &args) {
                         Ok(_) => 0,
                         Err(err) => {
-                            eprintln!("Errore nell'eseguire il programma: {:?}", err);
+                            error!("Error executing program: {:?}", err);
                             -1
                         }
                     }
                 }),
                 &mut stack,
                 clone_flags,
-                None,
+                Some(17),
             )
             .unwrap();
+
+            let non_root_uid = Uid::from_raw(1000);
+            setuid(non_root_uid).expect("Failed to drop root privileges");
 
             // Aspetta che il processo figlio termini
             match waitpid(child_pid, None).unwrap() {
@@ -414,7 +444,7 @@ mod common {
         Run {
             path: PathBuf,
             timeout_seconds: Option<u64>,
-            args: Option<Vec<String>>,
+            args: Option<String>,
         },
     }
 
@@ -516,9 +546,6 @@ mod app {
         #[arg(short, action = clap::ArgAction::Count)]
         pub verbose: u8,
 
-        #[arg(short, long, default_value = "/tmp/linux-av.sock")]
-        pub socket_path: PathBuf,
-
         #[arg(short, long, default_value = "/tmp/linux-av")]
         pub config_path: PathBuf,
 
@@ -536,6 +563,9 @@ mod app {
     pub struct SimpleClient {
         #[structopt(subcommand)]
         pub command: SimpleClientCommands,
+
+        #[arg(short, long, default_value = "/tmp/linux-av/linux-av.sock")]
+        pub socket_path: PathBuf,
     }
 
     #[derive(Subcommand)]
@@ -547,7 +577,7 @@ mod app {
         Run {
             path: PathBuf,
             timeout_seconds: Option<u64>,
-            args: Option<Vec<String>>,
+            args: Option<String>,
         },
     }
     #[derive(Parser)]
