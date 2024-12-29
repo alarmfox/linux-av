@@ -1,0 +1,8 @@
+total 0
+drwxr-xr-x    6 65534    65534          140 Dec 29 00:36 .
+drwxr-xr-x    6 65534    65534          140 Dec 29 00:36 ..
+drwxr-xr-x    2 65534    65534         1900 Dec 29 00:36 bin
+lrwxrwxrwx    1 65534    65534           11 Dec 28 20:49 linuxrc -> bin/busybox
+drwxr-xr-x    2 65534    65534           80 Dec 29 00:36 monitor
+drwxr-xr-x    2 65534    65534         1480 Dec 29 00:36 sbin
+drwxr-xr-x    4 65534    65534           80 Dec 29 00:36 usr

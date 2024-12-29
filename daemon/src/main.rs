@@ -18,6 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         2 => Level::DEBUG,
         _ => Level::TRACE,
     };
+
     // setup logging
     // Set up the default subscriber
     tracing_subscriber::fmt()
@@ -85,7 +86,7 @@ mod daemon {
         fs::{self, File},
         io::{self, BufRead, BufReader, Cursor},
         os::unix::{
-            fs::PermissionsExt,
+            fs::{chroot, PermissionsExt},
             net::{SocketAddr, UnixListener, UnixStream},
         },
         path::PathBuf,
@@ -93,12 +94,6 @@ mod daemon {
         sync::Arc,
     };
 
-    use nix::{
-        mount::{mount, MsFlags},
-        sched::{clone, CloneFlags},
-        sys::wait::{waitpid, WaitStatus},
-        unistd::execvp,
-    };
     use serde::Deserialize;
     use sha2::{Digest, Sha256};
     use tempfile::tempfile;
@@ -106,9 +101,12 @@ mod daemon {
     use yara::Compiler;
     use zip::ZipArchive;
 
-    use crate::common::{
-        Command, CommandResult, Error, ErrorResult, Request, RequestType, RunResult, ScanResult,
-        StatusResult, UpdateResult,
+    use crate::{
+        common::{
+            Command, CommandResult, Error, ErrorResult, Request, RequestType, RunResult,
+            ScanResult, StatusResult, UpdateResult,
+        },
+        sandbox::Sandbox,
     };
 
     #[derive(Debug)]
@@ -245,7 +243,8 @@ mod daemon {
                     version: self.version.clone(),
                 })),
                 Command::Run { path, args } => {
-                    let run_result = match me.clone().run_in_sandbox(path, args.clone()) {
+                    let sandbox = Sandbox::new(&self.config_path).map_err(Error::SandboxError)?;
+                    let run_result = match sandbox.run(path, args.clone()).await {
                         Ok(()) => RunResult { status: 0 },
                         Err(e) => {
                             error!("{:?}", e);
@@ -280,75 +279,6 @@ mod daemon {
                     }),
                 };
                 serde_json::to_writer(&socket, &response).unwrap();
-            }
-        }
-
-        fn run_in_sandbox(
-            self: Arc<Self>,
-            path: &PathBuf,
-            args: Option<String>,
-        ) -> Result<(), Error> {
-            let stack_size = 1024 * 1024;
-            let mut stack: Vec<u8> = vec![0; stack_size];
-
-            let clone_flags =
-                CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWNS;
-
-            let child_pid = clone(
-                Box::new(|| {
-                    // Mount a temporary filesystem
-                    if let Err(e) = mount(
-                        Some("tmpfs"),
-                        "/tmp",
-                        Some("tmpfs"),
-                        MsFlags::empty(),
-                        None::<&str>,
-                    ) {
-                        error!("Error mounting tmpfs: {:?}", e);
-                        return -1;
-                    }
-
-                    // Prepare the program and arguments to execute
-                    let c_program = CString::new(path.to_str().unwrap())
-                        .expect("Error converting program path");
-
-                    // Execute the specified program
-                    let mut args = match &args {
-                        Some(args) => args
-                            .split_whitespace()
-                            .map(|s| CString::new(s).unwrap())
-                            .collect(),
-                        None => vec![],
-                    };
-                    args.insert(0, c_program);
-                    match execvp(&args[0], &args) {
-                        Ok(_) => 0,
-                        Err(err) => {
-                            error!("Error executing program: {:?}", err);
-                            -1
-                        }
-                    }
-                }),
-                &mut stack,
-                clone_flags,
-                Some(nix::libc::SIGCHLD),
-            )
-            .unwrap();
-
-            // Aspetta che il processo figlio termini
-            match waitpid(child_pid, None).unwrap() {
-                WaitStatus::Exited(_, status) => {
-                    println!("Il processo figlio è terminato con stato: {}", status);
-                    Ok(())
-                }
-                WaitStatus::Signaled(_, signal, _) => {
-                    println!("Il processo figlio è terminato per segnale: {}", signal);
-                    Ok(())
-                }
-                _ => {
-                    eprintln!("Il processo figlio è terminato in modo inatteso");
-                    Ok(())
-                }
             }
         }
 
@@ -418,6 +348,8 @@ mod common {
     };
 
     use serde::{Deserialize, Serialize};
+
+    use crate::sandbox;
 
     #[derive(Serialize, Deserialize, Debug)]
     #[serde(rename_all = "snake_case")]
@@ -496,6 +428,7 @@ mod common {
         IoError(io::Error),
         ZipError,
         YaraError(yara::errors::Error),
+        SandboxError(sandbox::Error),
     }
 
     impl Display for Error {
@@ -505,6 +438,7 @@ mod common {
                 Error::IoError(e) => write!(f, "IO error: {}", e),
                 Error::ZipError => write!(f, "Zip error"),
                 Error::YaraError(e) => write!(f, "Yara error: {}", e),
+                Error::SandboxError(e) => write!(f, "Sandbox error: {}", e),
             }
         }
     }
@@ -563,5 +497,171 @@ mod app {
     #[derive(Subcommand)]
     pub enum DaemonCommands {
         Start,
+    }
+}
+
+mod sandbox {
+
+    use std::{
+        ffi::CString,
+        fmt::Display,
+        fs::{create_dir_all, remove_dir_all, File},
+        io::{self, BufRead, BufWriter, Read},
+        os::fd::FromRawFd,
+        path::PathBuf,
+    };
+
+    use nix::{
+        fcntl::OFlag,
+        libc::{O_DIRECT, STDOUT_FILENO},
+        mount::{mount, MsFlags},
+        sched::{clone, CloneFlags},
+        sys::wait::{waitpid, WaitStatus},
+        unistd::{chroot, close, dup2, execv, execvp, pipe2},
+    };
+    use tar::Archive;
+    use tracing::error;
+    use uuid::Uuid;
+
+    pub struct Sandbox {
+        id: String,
+        path: PathBuf,
+    }
+
+    #[derive(Debug)]
+    pub enum Error {
+        OsError(nix::Error),
+    }
+    impl Display for Error {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Error::OsError(e) => write!(f, "OS error: {}", e),
+            }
+        }
+    }
+
+    impl Sandbox {
+        pub fn new(base_path: &PathBuf) -> Result<Self, Error> {
+            let id = format!("sandbox.{}", Uuid::new_v4());
+            let path = base_path.join(PathBuf::from(id.clone()));
+
+            create_dir_all(&path).expect("Cannot initiate sandbox. Failed to create directory");
+
+            let file = File::open("/tmp/linux-av/distrobox.tar")
+                .expect("Distrobox not found. Check your installation");
+            Archive::new(file)
+                .unpack(&path)
+                .expect("Cannot unpack base system into sandbox filesystem");
+
+            create_dir_all(path.join("monitor")).expect("Failed to create monitor directory");
+
+            Ok(Sandbox { id, path })
+        }
+        pub async fn run(&self, path: &PathBuf, args: Option<String>) -> Result<(), Error> {
+            let stack_size = 1024 * 1024;
+            let mut stack: Vec<u8> = vec![0; stack_size];
+
+            let clone_flags =
+                CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWNS;
+
+            let pipe_stdout = pipe2(OFlag::O_DIRECT | OFlag::O_CLOEXEC).unwrap();
+            let pipe_stderr = pipe2(OFlag::O_DIRECT | OFlag::O_CLOEXEC).unwrap();
+
+            let stdout_path = self.path.join("monitor").join("stdout");
+            let stderr_path = self.path.join("monitor").join("stderr");
+            let monitor_handle = tokio::spawn(async move {
+                close(pipe_stdout.1).unwrap();
+                close(pipe_stderr.1).unwrap();
+                write_raw_fd(&stdout_path, pipe_stdout.0).unwrap();
+                write_raw_fd(&stderr_path, pipe_stderr.0).unwrap();
+            });
+            let child = clone(
+                Box::new(|| {
+                    if let Err(e) = chroot(&self.path) {
+                        error!("Error changing root: {:?}", e);
+                        return -1;
+                    }
+                    std::env::set_current_dir("/").unwrap();
+
+                    // Prepare the program and arguments to execute
+                    let c_program = CString::new(path.to_str().unwrap())
+                        .expect("Error converting program path");
+
+                    // Execute the specified program
+                    let mut args = match &args {
+                        Some(args) => args
+                            .split_whitespace()
+                            .map(|s| CString::new(s).unwrap())
+                            .collect(),
+                        None => vec![],
+                    };
+                    args.insert(0, c_program);
+                    close(STDOUT_FILENO).unwrap();
+                    close(pipe_stdout.0).unwrap();
+                    dup2(pipe_stdout.1, STDOUT_FILENO).unwrap();
+                    match execv(&args[0], &args) {
+                        Ok(_) => 0,
+                        Err(err) => {
+                            error!("Error executing program: {:?}", err);
+                            -1
+                        }
+                    }
+                }),
+                &mut stack,
+                clone_flags,
+                Some(nix::libc::SIGCHLD),
+            );
+
+            let process_output = match child {
+                Ok(pid) => match waitpid(pid, None).unwrap() {
+                    WaitStatus::Exited(_, _) => Ok(()),
+                    WaitStatus::Signaled(_, _, _) => Ok(()),
+                    _ => {
+                        error!("Process terminated in an unexpected way");
+                        Ok(())
+                    }
+                },
+                Err(e) => Err(Error::OsError(e)),
+            };
+
+            tokio::join!(monitor_handle).0.unwrap();
+            return process_output;
+        }
+        pub fn delete(&self) -> Result<(), io::Error> {
+            remove_dir_all(self.path.clone())
+        }
+    }
+
+    impl Sandbox {
+        pub fn get_path(&self) -> PathBuf {
+            return self.path.clone();
+        }
+    }
+
+    fn write_raw_fd(dest: &PathBuf, fd: i32) -> Result<u64, io::Error> {
+        let f = unsafe { File::from_raw_fd(fd) };
+        let mut reader = io::BufReader::new(f);
+        let dest = File::create(dest).unwrap();
+        let mut writer = io::BufWriter::new(dest);
+        io::copy(&mut reader, &mut writer)
+    }
+
+    #[cfg(test)]
+    mod test {
+        use std::path::PathBuf;
+
+        use crate::sandbox::Sandbox;
+
+        #[tokio::test]
+        async fn execute_simple_shell_command() {
+            let sandbox = Sandbox::new(&PathBuf::from("/tmp"));
+            assert!(sandbox.is_ok());
+            assert!(sandbox
+                .unwrap()
+                .run(&PathBuf::from("/bin/ls"), Some("-la".to_string()))
+                .await
+                .is_ok());
+            // assert_file_content(&sandbox.get_path().join(stdout_path), expected);
+        }
     }
 }
