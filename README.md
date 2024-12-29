@@ -1,4 +1,4 @@
-# linux-av: A Linux malware detection program
+# linux-av: A malware detection program for Linux
 
 **WARNING**: the following program is not production ready.
 
