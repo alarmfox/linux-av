@@ -1,4 +1,4 @@
-use std::{fs, os::unix::net::UnixStream};
+use std::os::unix::net::UnixStream;
 
 use app::{Cli, Command, DaemonCommands, SimpleClientCommands};
 use clap::Parser;
@@ -82,11 +82,10 @@ mod daemon {
     const YR_CORE_FILE: [&'static str; 3] = ["packages", "core", "yara-rules-core.yar"];
 
     use std::{
-        ffi::CString,
         fs::{self, File},
         io::{self, BufRead, BufReader, Cursor},
         os::unix::{
-            fs::{chroot, PermissionsExt},
+            fs::PermissionsExt,
             net::{SocketAddr, UnixListener, UnixStream},
         },
         path::PathBuf,
@@ -112,7 +111,6 @@ mod daemon {
     #[derive(Debug)]
     pub struct Daemon {
         version: String,
-        rtp_on: bool,
 
         socket_path: PathBuf,
         config_path: PathBuf,
@@ -137,7 +135,6 @@ mod daemon {
 
             Ok(Self {
                 version: VERSION.to_string(),
-                rtp_on: false,
                 config_path,
                 socket_path,
             })
@@ -239,7 +236,6 @@ mod daemon {
                     Ok(CommandResult::Update(UpdateResult { status: 0 }))
                 }
                 Command::Status => Ok(CommandResult::Status(StatusResult {
-                    rtp_on: self.rtp_on.clone(),
                     version: self.version.clone(),
                 })),
                 Command::Run { path, args } => {
@@ -251,6 +247,7 @@ mod daemon {
                             RunResult { status: 1 }
                         }
                     };
+                    sandbox.delete().unwrap();
                     Ok(CommandResult::Run(run_result))
                 }
             }
@@ -400,7 +397,6 @@ mod common {
     #[derive(Serialize, Deserialize, Debug)]
     pub struct StatusResult {
         pub version: String,
-        pub rtp_on: bool,
     }
     #[derive(Serialize, Deserialize, Debug)]
     pub struct RunResult {
@@ -505,27 +501,47 @@ mod sandbox {
     use std::{
         ffi::CString,
         fmt::Display,
-        fs::{create_dir_all, remove_dir_all, File},
-        io::{self, BufRead, BufWriter, Read},
-        os::fd::FromRawFd,
+        fs::{self, create_dir_all, remove_dir_all, File},
+        io::{self, BufReader, Read},
+        os::{
+            fd::FromRawFd,
+            unix::net::{UnixListener, UnixStream},
+        },
         path::PathBuf,
+        time::Duration,
     };
 
     use nix::{
         fcntl::OFlag,
-        libc::{O_DIRECT, STDOUT_FILENO},
-        mount::{mount, MsFlags},
+        libc::STDOUT_FILENO,
+        mount::{self, mount, MsFlags},
         sched::{clone, CloneFlags},
-        sys::wait::{waitpid, WaitStatus},
-        unistd::{chroot, close, dup2, execv, execvp, pipe2},
+        sys::{
+            signal::{kill, Signal},
+            statfs::FsType,
+            wait::{waitpid, WaitStatus},
+        },
+        unistd::{chroot, close, dup2, execv, fork, pipe2, ForkResult, Pid},
     };
+    use serde::{Deserialize, Serialize};
     use tar::Archive;
     use tracing::error;
     use uuid::Uuid;
 
     pub struct Sandbox {
         id: String,
-        path: PathBuf,
+        base_path: PathBuf,
+        root_path: PathBuf,
+        control_path: PathBuf,
+
+        shim_pid: Option<Pid>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    enum ShimCommand {
+        Run { path: PathBuf, args: Option<String> },
+        Ping,
+        Exit,
     }
 
     #[derive(Debug)]
@@ -543,63 +559,168 @@ mod sandbox {
     impl Sandbox {
         pub fn new(base_path: &PathBuf) -> Result<Self, Error> {
             let id = format!("sandbox.{}", Uuid::new_v4());
-            let path = base_path.join(PathBuf::from(id.clone()));
+            let base_path = base_path.join(PathBuf::from(id.clone()));
+            let root_path = base_path.join(PathBuf::from("root"));
+            let control_path = root_path.join(PathBuf::from("control.sock"));
+            let mut sandbox = Sandbox {
+                id,
+                base_path: base_path.clone(),
+                root_path: root_path.clone(),
+                control_path: control_path.clone(),
+                shim_pid: None,
+            };
 
-            create_dir_all(&path).expect("Cannot initiate sandbox. Failed to create directory");
+            // create base structure
+            Self::create_base_structure(&base_path, &root_path).unwrap();
 
-            let file = File::open("/tmp/linux-av/distrobox.tar")
-                .expect("Distrobox not found. Check your installation");
-            Archive::new(file)
-                .unpack(&path)
-                .expect("Cannot unpack base system into sandbox filesystem");
+            // create shim
+            sandbox.create_shim(&base_path, &control_path).unwrap();
 
-            create_dir_all(path.join("monitor")).expect("Failed to create monitor directory");
-
-            Ok(Sandbox { id, path })
+            Ok(sandbox)
         }
-        pub async fn run(&self, path: &PathBuf, args: Option<String>) -> Result<(), Error> {
+
+        pub async fn run(&self, program: &PathBuf, args: Option<String>) -> Result<(), Error> {
+            let launch_path = self
+                .root_path
+                .join("tmp/")
+                .join(program.file_name().unwrap());
+            fs::copy(program, &launch_path).expect("Failed to copy program to launch path");
+
+            let conn =
+                UnixStream::connect(self.control_path.clone()).expect("Client cannot send request");
+
+            let request = ShimCommand::Run {
+                path: launch_path,
+                args,
+            };
+
+            serde_json::to_writer(conn, &request).unwrap();
+
+            Ok(())
+        }
+
+        pub fn delete(&self) -> Result<(), io::Error> {
+            let conn =
+                UnixStream::connect(self.control_path.clone()).expect("Client cannot send request");
+            serde_json::to_writer(conn, &ShimCommand::Exit).unwrap();
+            if let Some(pid) = self.shim_pid {
+                kill(pid, Signal::SIGKILL).unwrap();
+            }
+            remove_dir_all(self.base_path.clone())
+        }
+
+        fn create_shim(
+            &mut self,
+            base_path: &PathBuf,
+            control_path: &PathBuf,
+        ) -> Result<(), Error> {
             let stack_size = 1024 * 1024;
             let mut stack: Vec<u8> = vec![0; stack_size];
 
-            let clone_flags =
-                CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWNS;
+            let clone_flags = CloneFlags::CLONE_NEWUSER
+                | CloneFlags::CLONE_NEWNET
+                | CloneFlags::CLONE_NEWNS
+                | CloneFlags::CLONE_NEWPID;
 
-            let pipe_stdout = pipe2(OFlag::O_DIRECT | OFlag::O_CLOEXEC).unwrap();
-            let pipe_stderr = pipe2(OFlag::O_DIRECT | OFlag::O_CLOEXEC).unwrap();
-
-            let stdout_path = self.path.join("monitor").join("stdout");
-            let stderr_path = self.path.join("monitor").join("stderr");
-            let monitor_handle = tokio::spawn(async move {
-                close(pipe_stdout.1).unwrap();
-                close(pipe_stderr.1).unwrap();
-                write_raw_fd(&stdout_path, pipe_stdout.0).unwrap();
-                write_raw_fd(&stderr_path, pipe_stderr.0).unwrap();
-            });
             let child = clone(
                 Box::new(|| {
-                    if let Err(e) = chroot(&self.path) {
+                    let listener = UnixListener::bind(control_path.clone()).unwrap();
+                    if let Err(e) = chroot(base_path) {
                         error!("Error changing root: {:?}", e);
                         return -1;
                     }
                     std::env::set_current_dir("/").unwrap();
 
-                    // Prepare the program and arguments to execute
-                    let c_program = CString::new(path.to_str().unwrap())
+                    loop {
+                        match listener.accept() {
+                            Ok((conn, _)) => {
+                                let mut request = serde_json::Deserializer::from_reader(&conn);
+                                match ShimCommand::deserialize(&mut request) {
+                                    Ok(cmd) => match cmd {
+                                        ShimCommand::Run { path, args } => {
+                                            println!(
+                                                "Shim: run command recvd: {:?} {:?}",
+                                                path, args
+                                            );
+                                            self.run_process(&path, args);
+                                        }
+                                        ShimCommand::Exit => {
+                                            println!("Shim: exit command recvd");
+                                            break;
+                                        }
+                                        ShimCommand::Ping => {
+                                            println!("Shim: ping command recvd");
+                                        }
+                                    },
+                                    Err(e) => {
+                                        error!("cannot deserialize command {}", e)
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("cannot accept connection {}", e);
+                                break;
+                            }
+                        };
+                    }
+                    0
+                }),
+                &mut stack,
+                clone_flags,
+                Some(nix::libc::SIGCHLD),
+            )
+            .unwrap();
+
+            loop {
+                match UnixStream::connect(control_path.clone()) {
+                    Ok(socket) => {
+                        serde_json::to_writer(socket, &ShimCommand::Ping).unwrap();
+                        break;
+                    }
+                    Err(e) => {
+                        println!("test connection: {:?}", e);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+
+            self.shim_pid = Some(child);
+            Ok(())
+        }
+
+        fn run_process(&self, program: &PathBuf, args: Option<String>) {
+            let stack_size = 1024 * 1024;
+            let mut stack: Vec<u8> = vec![0; stack_size];
+
+            let clone_flags = CloneFlags::CLONE_PARENT;
+            let pipe_stdout = pipe2(OFlag::O_DIRECT | OFlag::O_CLOEXEC).unwrap();
+            let pipe_stderr = pipe2(OFlag::O_DIRECT | OFlag::O_CLOEXEC).unwrap();
+
+            let stdout_path = self.base_path.join("monitor").join("stdout");
+            let stderr_path = self.base_path.join("monitor").join("stderr");
+
+            let monitor_handle = std::thread::spawn(move || {
+                close(pipe_stdout.1).unwrap();
+                close(pipe_stderr.1).unwrap();
+                write_raw_fd(&stdout_path, pipe_stdout.0).unwrap();
+                write_raw_fd(&stderr_path, pipe_stderr.0).unwrap();
+            });
+
+            let child = clone(
+                Box::new(|| {
+                    let c_program = CString::new(program.to_str().unwrap())
                         .expect("Error converting program path");
 
-                    // Execute the specified program
-                    let mut args = match &args {
+                    let mut c_args = match &args {
                         Some(args) => args
                             .split_whitespace()
                             .map(|s| CString::new(s).unwrap())
                             .collect(),
                         None => vec![],
                     };
-                    args.insert(0, c_program);
-                    close(STDOUT_FILENO).unwrap();
-                    close(pipe_stdout.0).unwrap();
-                    dup2(pipe_stdout.1, STDOUT_FILENO).unwrap();
-                    match execv(&args[0], &args) {
+                    c_args.insert(0, c_program);
+
+                    match execv(&c_args[0], &c_args) {
                         Ok(_) => 0,
                         Err(err) => {
                             error!("Error executing program: {:?}", err);
@@ -612,29 +733,30 @@ mod sandbox {
                 Some(nix::libc::SIGCHLD),
             );
 
-            let process_output = match child {
+            match child {
                 Ok(pid) => match waitpid(pid, None).unwrap() {
-                    WaitStatus::Exited(_, _) => Ok(()),
-                    WaitStatus::Signaled(_, _, _) => Ok(()),
-                    _ => {
-                        error!("Process terminated in an unexpected way");
-                        Ok(())
-                    }
+                    WaitStatus::Exited(_, _) => println!("Process exited successfully"),
+                    WaitStatus::Signaled(_, _, _) => println!("Process was killed by a signal"),
+                    _ => println!("Process terminated in an unexpected way"),
                 },
-                Err(e) => Err(Error::OsError(e)),
-            };
-
-            tokio::join!(monitor_handle).0.unwrap();
-            return process_output;
+                Err(e) => error!("Failed to clone process: {:?}", e),
+            }
+            monitor_handle.join().unwrap();
         }
-        pub fn delete(&self) -> Result<(), io::Error> {
-            remove_dir_all(self.path.clone())
-        }
-    }
 
-    impl Sandbox {
-        pub fn get_path(&self) -> PathBuf {
-            return self.path.clone();
+        fn create_base_structure(base_path: &PathBuf, root_path: &PathBuf) -> Result<(), Error> {
+            create_dir_all(&root_path)
+                .expect("Cannot initiate sandbox. Failed to create directory");
+
+            let file = File::open("/tmp/linux-av/busybox.tar")
+                .expect("Distrobox not found. Check your installation");
+            Archive::new(file)
+                .unpack(&root_path)
+                .expect("Cannot unpack base system into sandbox filesystem");
+
+            create_dir_all(base_path.join("monitor")).expect("Failed to create monitor directory");
+            create_dir_all(root_path.join("tmp")).expect("Failed to create monitor directory");
+            Ok(())
         }
     }
 
@@ -654,14 +776,13 @@ mod sandbox {
 
         #[tokio::test]
         async fn execute_simple_shell_command() {
-            let sandbox = Sandbox::new(&PathBuf::from("/tmp"));
-            assert!(sandbox.is_ok());
+            let sandbox = Sandbox::new(&PathBuf::from("/tmp")).expect("cannot create sandbox");
             assert!(sandbox
-                .unwrap()
                 .run(&PathBuf::from("/bin/ls"), Some("-la".to_string()))
                 .await
                 .is_ok());
             // assert_file_content(&sandbox.get_path().join(stdout_path), expected);
+            // sandbox.delete().expect("Cannot delete sandbox");
         }
     }
 }
