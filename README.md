@@ -1,11 +1,8 @@
-# linux-av: A Linux malware detection program
+# linux-av: A malware detection program for Linux
 
-**WARNING**: the following program is not production ready.
+**WARNING**: this project is not production ready.
 
-A basic malware scanner written in Rust for desktop Linux users.
-
-The application has a server that manages rules, signatures and
-communicates with clients through UNIX sockets.
+A basic malware scanner written in Rust for Linux desktop users.
 
 ## Features
 
