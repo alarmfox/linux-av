@@ -12,4 +12,3 @@ WORKDIR /app
 ENTRYPOINT ["cargo", "watch", "-c", "-d", "5", "--"]
 
 CMD ["run"]
-

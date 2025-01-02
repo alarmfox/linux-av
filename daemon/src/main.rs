@@ -1,4 +1,4 @@
-use std::{fs, os::unix::net::UnixStream};
+use std::os::unix::net::UnixStream;
 
 use app::{Cli, Command, DaemonCommands, SimpleClientCommands};
 use clap::Parser;
@@ -82,11 +82,10 @@ mod daemon {
     const YR_CORE_FILE: [&'static str; 3] = ["packages", "core", "yara-rules-core.yar"];
 
     use std::{
-        ffi::CString,
         fs::{self, File},
         io::{self, BufRead, BufReader, Cursor},
         os::unix::{
-            fs::{chroot, PermissionsExt},
+            fs::PermissionsExt,
             net::{SocketAddr, UnixListener, UnixStream},
         },
         path::PathBuf,
@@ -506,18 +505,17 @@ mod sandbox {
         ffi::CString,
         fmt::Display,
         fs::{create_dir_all, remove_dir_all, File},
-        io::{self, BufRead, BufWriter, Read},
+        io::{self},
         os::fd::FromRawFd,
         path::PathBuf,
     };
 
     use nix::{
         fcntl::OFlag,
-        libc::{O_DIRECT, STDOUT_FILENO},
-        mount::{mount, MsFlags},
+        libc::STDOUT_FILENO,
         sched::{clone, CloneFlags},
         sys::wait::{waitpid, WaitStatus},
-        unistd::{chroot, close, dup2, execv, execvp, pipe2},
+        unistd::{chroot, close, dup2, execv, pipe2},
     };
     use tar::Archive;
     use tracing::error;

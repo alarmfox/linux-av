@@ -14,6 +14,3 @@ communicates with clients through UNIX sockets.
 - [ ] Sandboxing
 - [ ] Concurrent server
 - [ ] Support persistent connections with live updates
-
-
-
