@@ -19,6 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => Level::TRACE,
     };
 
+    println!("starting");
     // setup logging
     // Set up the default subscriber
     tracing_subscriber::fmt()
@@ -104,7 +105,6 @@ mod daemon {
         fs::{self, File},
         io::{self, BufRead, BufReader, Cursor, Read, Write},
         os::unix::{fs::PermissionsExt, net::UnixListener},
-
         path::PathBuf,
         process,
         sync::Arc,
@@ -246,8 +246,7 @@ mod daemon {
                     version: self.version.clone(),
                 })),
                 Command::Run { path, args } => {
-                    let sandbox =
-                        Sandbox::new(&self.config_path).map_err(Error::SandboxError)?;
+                    let sandbox = Sandbox::new(&self.config_path).map_err(Error::SandboxError)?;
                     let run_result = match sandbox.run(path, args.clone()) {
                         Ok((stdout, stderr)) => RunResult {
                             status: 0,
@@ -490,7 +489,6 @@ mod sandbox {
             fd::FromRawFd,
             unix::net::{UnixListener, UnixStream},
         },
-
         path::PathBuf,
         sync::mpsc::{self, Receiver},
         thread::{self, JoinHandle},
