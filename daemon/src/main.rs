@@ -19,7 +19,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => Level::TRACE,
     };
 
-    println!("starting");
     // setup logging
     // Set up the default subscriber
     tracing_subscriber::fmt()
