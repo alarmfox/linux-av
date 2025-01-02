@@ -1,14 +1,14 @@
+use std::io::Read;
 use std::os::unix::net::UnixStream;
 
-use app::{Cli, Command, DaemonCommands, SimpleClientCommands};
+use app::{Cli, ClientCommands, Command, DaemonCommands};
 use clap::Parser;
 use common::CommandResult;
 use serde::Deserialize;
 use tracing::error;
 use tracing::Level;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     // You can see how many times a particular flag or argument occurred
     // Note, only flags can have multiple occurrences
@@ -31,35 +31,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Daemon(action) => match action.command {
             DaemonCommands::Start => {
-                daemon::Daemon::new(cli.config_path)?.start().await?;
+                daemon::Daemon::new(cli.config_path)?.start().unwrap();
             }
         },
-        Command::SimpleClient(action) => {
+        Command::Client(action) => {
             let request = match action.command {
-                SimpleClientCommands::Scan { path } => common::Request {
+                ClientCommands::Scan { path } => common::Request {
                     command: common::Command::Scan {
                         path,
                         offline: true,
                     },
                 },
-                SimpleClientCommands::Update => common::Request {
+                ClientCommands::Update => common::Request {
                     command: common::Command::Update,
                 },
-                SimpleClientCommands::Run { path, args } => common::Request {
+                ClientCommands::Run { path, args } => common::Request {
                     command: common::Command::Run { path, args },
                 },
             };
-            let request = common::RequestType::Simple(request);
-            let conn = UnixStream::connect(action.socket_path)?;
+            let mut conn = UnixStream::connect(action.socket_path)?;
             serde_json::to_writer(&conn, &request)?;
             let mut response = serde_json::Deserializer::from_reader(&conn);
             match CommandResult::deserialize(&mut response) {
                 Ok(result) => {
                     let a = serde_json::to_string(&result).unwrap();
                     println!("{}", a);
+                    match result {
+                        CommandResult::Run(_) => {
+                            let mut buf = [0; 1024];
+                            loop {
+                                match conn.read(&mut buf) {
+                                    Ok(n) => match n {
+                                        0 => break,
+                                        _ => {
+                                            let s = String::from_utf8(buf[..n].to_vec()).unwrap();
+                                            println!("{}", s);
+                                        }
+                                    },
+                                    Err(e) => {
+                                        error!("{}", e);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 Err(e) => {
-                    error!("{}", e.to_string());
+                    error!("cannot deserialize response {}", e.to_string());
                 }
             }
         }
@@ -79,15 +98,13 @@ mod daemon {
     const YR_CORE_URL: &str =
         "https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-core.zip";
 
-    const YR_CORE_FILE: [&'static str; 3] = ["packages", "core", "yara-rules-core.yar"];
+    const YR_CORE_FILE: &str = "packages/core/yara-rules-core.yar";
 
     use std::{
         fs::{self, File},
-        io::{self, BufRead, BufReader, Cursor},
-        os::unix::{
-            fs::PermissionsExt,
-            net::{SocketAddr, UnixListener, UnixStream},
-        },
+        io::{self, BufRead, BufReader, Cursor, Read, Write},
+        os::unix::{fs::PermissionsExt, net::UnixListener},
+
         path::PathBuf,
         process,
         sync::Arc,
@@ -102,8 +119,8 @@ mod daemon {
 
     use crate::{
         common::{
-            Command, CommandResult, Error, ErrorResult, Request, RequestType, RunResult,
-            ScanResult, StatusResult, UpdateResult,
+            Command, CommandResult, Error, ErrorResult, Request, RunResult, ScanResult,
+            StatusResult, UpdateResult,
         },
         sandbox::Sandbox,
     };
@@ -111,7 +128,6 @@ mod daemon {
     #[derive(Debug)]
     pub struct Daemon {
         version: String,
-        rtp_on: bool,
 
         socket_path: PathBuf,
         config_path: PathBuf,
@@ -136,13 +152,12 @@ mod daemon {
 
             Ok(Self {
                 version: VERSION.to_string(),
-                rtp_on: false,
                 config_path,
                 socket_path,
             })
         }
 
-        pub async fn start(self: Self) -> Result<(), Box<dyn std::error::Error>> {
+        pub fn start(self: Self) -> Result<(), Box<dyn std::error::Error>> {
             let listener = UnixListener::bind(self.socket_path.clone())?;
             let me = Arc::new(self);
 
@@ -153,37 +168,40 @@ mod daemon {
 
             loop {
                 match listener.accept() {
-                    Ok((socket, sa)) => {
-                        let mut request = serde_json::Deserializer::from_reader(&socket);
-                        let response = match RequestType::deserialize(&mut request) {
-                            Ok(request_type) => match request_type {
-                                RequestType::Simple(request) => {
-                                    match me.clone().handle_simple_request(&request).await {
-                                        Ok(result) => result,
-                                        Err(e) => CommandResult::Error(ErrorResult {
-                                            kind: format!(
-                                                "command {} returned an error",
-                                                request.command
-                                            ),
-                                            message: Some(e.to_string()),
-                                        }),
-                                    }
-                                }
-                                RequestType::Persistent => {
-                                    match me.clone().handle_persistent_connection(socket, sa).await
-                                    {
-                                        Ok(_) => {}
-                                        Err(e) => error!("{:?}", e),
-                                    };
-                                    continue;
-                                }
+                    Ok((mut conn, _sa)) => {
+                        let mut request = serde_json::Deserializer::from_reader(&conn);
+                        let response = match Request::deserialize(&mut request) {
+                            Ok(request) => match me.clone().handle_request(&request) {
+                                Ok(result) => result,
+                                Err(e) => CommandResult::Error(ErrorResult {
+                                    kind: format!("command {} returned an error", request.command),
+                                    message: Some(e.to_string()),
+                                }),
                             },
                             Err(e) => CommandResult::Error(ErrorResult {
                                 kind: "invalid request".to_string(),
                                 message: Some(e.to_string()),
                             }),
                         };
-                        serde_json::to_writer(socket, &response).unwrap();
+                        match response {
+                            CommandResult::Run(result) => {
+                                let response = CommandResult::Run(RunResult {
+                                    status: result.status,
+                                    stderr: None,
+                                    stdout: None,
+                                });
+                                let serialized_response = serde_json::to_vec(&response).unwrap();
+                                conn.write(&serialized_response).unwrap();
+                                if let Some(stdout) = result.stdout {
+                                    while let Ok(data) = stdout.recv() {
+                                        conn.write_all(&data).unwrap();
+                                    }
+                                }
+                            }
+                            _ => {
+                                serde_json::to_writer(conn, &response).unwrap();
+                            }
+                        }
                     }
                     Err(e) => error!("accept function failed: {:?}", e),
                 }
@@ -191,10 +209,7 @@ mod daemon {
         }
 
         #[tracing::instrument(skip(self), level = "trace", ret)]
-        async fn handle_simple_request(
-            self: Arc<Self>,
-            request: &Request,
-        ) -> Result<CommandResult, Error> {
+        fn handle_request(self: Arc<Self>, request: &Request) -> Result<CommandResult, Error> {
             let me = self.clone();
             match &request.command {
                 Command::Scan { path, .. } => {
@@ -203,81 +218,54 @@ mod daemon {
                     }
 
                     let path1 = path.clone();
-                    let t1 = tokio::spawn(async {
-                        let mut file = File::open(path1).unwrap();
-                        let mut sha256 = Sha256::new();
-                        io::copy(&mut file, &mut sha256).map_err(Error::IoError)?;
-                        let hash = sha256.finalize();
-                        let hash = format!("{:x}", hash);
+                    let mut file = File::open(path1).unwrap();
+                    let mut sha256 = Sha256::new();
+                    io::copy(&mut file, &mut sha256).map_err(Error::IoError)?;
+                    let hash = sha256.finalize();
+                    let hash = format!("{:x}", hash);
 
-                        me.scan_sig(hash.as_str())
-                    });
+                    let is_threat = me.scan_sig(hash.as_str())?;
 
                     let path = path.clone();
-                    let t2 = tokio::spawn(async move { self.yara_scan(path) });
-
-                    let (r1, r2) = tokio::join!(t1, t2);
-                    let is_threat = r1.unwrap()?;
-
-                    let yr_result = r2.unwrap().map_err(Error::YaraError)?;
+                    let yara_result = self.yara_scan(path).map_err(Error::YaraError)?;
 
                     Ok(CommandResult::Scan(ScanResult {
                         threat: is_threat,
-                        intelligence: Some(yr_result),
+                        intelligence: Some(yara_result),
                     }))
                 }
                 Command::Update => {
-                    let t1 =
-                        tokio::spawn(download_and_extract(MB_SHA256_URL, me.config_path.clone()));
-                    let t2 =
-                        tokio::spawn(download_and_extract(YR_CORE_URL, me.config_path.clone()));
+                    download_and_extract(MB_SHA256_URL, me.config_path.clone()).unwrap();
+                    download_and_extract(YR_CORE_URL, me.config_path.clone()).unwrap();
 
-                    let (r1, r2) = tokio::join!(t1, t2);
                     //TODO: handle results
 
                     Ok(CommandResult::Update(UpdateResult { status: 0 }))
                 }
                 Command::Status => Ok(CommandResult::Status(StatusResult {
-                    rtp_on: self.rtp_on.clone(),
                     version: self.version.clone(),
                 })),
                 Command::Run { path, args } => {
-                    let sandbox = Sandbox::new(&self.config_path).map_err(Error::SandboxError)?;
-                    let run_result = match sandbox.run(path, args.clone()).await {
-                        Ok(()) => RunResult { status: 0 },
+                    let sandbox =
+                        Sandbox::new(&self.config_path).map_err(Error::SandboxError)?;
+                    let run_result = match sandbox.run(path, args.clone()) {
+                        Ok((stdout, stderr)) => RunResult {
+                            status: 0,
+                            stdout: Some(stdout),
+                            stderr: Some(stderr),
+                        },
                         Err(e) => {
                             error!("{:?}", e);
-                            RunResult { status: 1 }
+                            RunResult {
+                                status: -1,
+                                stdout: None,
+                                stderr: None,
+                            }
                         }
                     };
+                    sandbox.delete().unwrap();
                     Ok(CommandResult::Run(run_result))
                 }
-            }
-        }
-
-        #[tracing::instrument(skip(self), level = "trace")]
-        async fn handle_persistent_connection(
-            self: Arc<Self>,
-            socket: UnixStream,
-            peer: SocketAddr,
-        ) -> Result<(), Error> {
-            let me = self.clone();
-            loop {
-                let mut request = serde_json::Deserializer::from_reader(&socket);
-                let response = match Request::deserialize(&mut request) {
-                    Ok(request) => match me.clone().handle_simple_request(&request).await {
-                        Ok(result) => result,
-                        Err(e) => CommandResult::Error(ErrorResult {
-                            kind: format!("command {} returned an error", request.command),
-                            message: Some(e.to_string()),
-                        }),
-                    },
-                    Err(e) => CommandResult::Error(ErrorResult {
-                        kind: format!("bad request"),
-                        message: Some(e.to_string()),
-                    }),
-                };
-                serde_json::to_writer(&socket, &response).unwrap();
             }
         }
 
@@ -298,11 +286,7 @@ mod daemon {
         }
 
         fn yara_scan(self: Arc<Self>, target: PathBuf) -> Result<Vec<String>, yara::errors::Error> {
-            let yr_path = self
-                .config_path
-                .join(YR_CORE_FILE[0])
-                .join(YR_CORE_FILE[1])
-                .join(YR_CORE_FILE[2]);
+            let yr_path = self.config_path.join(YR_CORE_FILE);
 
             let compiler = Compiler::new()?.add_rules_file(yr_path)?;
 
@@ -317,13 +301,11 @@ mod daemon {
         }
     }
 
-    async fn download_and_extract(url: &str, dest_directory: PathBuf) -> Result<(), Error> {
+    fn download_and_extract(url: &str, dest_directory: PathBuf) -> Result<(), Error> {
         let mut tempfile = tempfile().map_err(|e| Error::IoError(e))?;
-        let response = reqwest::get(url)
-            .await
+        let response = reqwest::blocking::get(url)
             .map_err(Error::NetworkError)?
             .bytes()
-            .await
             .map_err(Error::NetworkError)?;
 
         let mut stream = Cursor::new(response);
@@ -344,6 +326,7 @@ mod common {
         fmt::{self, Display},
         io,
         path::PathBuf,
+        sync::mpsc::Receiver,
     };
 
     use serde::{Deserialize, Serialize};
@@ -373,12 +356,6 @@ mod common {
             }
         }
     }
-    #[derive(Deserialize, Serialize, Debug)]
-    #[serde(rename_all = "snake_case")]
-    pub enum RequestType {
-        Simple(Request),
-        Persistent,
-    }
 
     #[derive(Deserialize, Serialize, Debug)]
     pub struct Request {
@@ -399,11 +376,14 @@ mod common {
     #[derive(Serialize, Deserialize, Debug)]
     pub struct StatusResult {
         pub version: String,
-        pub rtp_on: bool,
     }
     #[derive(Serialize, Deserialize, Debug)]
     pub struct RunResult {
         pub status: i32,
+        #[serde(skip)]
+        pub stdout: Option<Receiver<Vec<u8>>>,
+        #[serde(skip)]
+        pub stderr: Option<Receiver<Vec<u8>>>,
     }
     #[derive(Serialize, Deserialize, Debug)]
     pub struct ErrorResult {
@@ -462,21 +442,21 @@ mod app {
 
     #[derive(Subcommand)]
     pub enum Command {
-        SimpleClient(SimpleClient),
+        Client(SimpleClient),
         Daemon(Daemon),
     }
 
     #[derive(Parser)]
     pub struct SimpleClient {
         #[structopt(subcommand)]
-        pub command: SimpleClientCommands,
+        pub command: ClientCommands,
 
         #[arg(short, long, default_value = "/tmp/linux-av/linux-av.sock")]
         pub socket_path: PathBuf,
     }
 
     #[derive(Subcommand)]
-    pub enum SimpleClientCommands {
+    pub enum ClientCommands {
         Scan {
             path: PathBuf,
         },
@@ -504,36 +484,70 @@ mod sandbox {
     use std::{
         ffi::CString,
         fmt::Display,
-        fs::{create_dir_all, remove_dir_all, File},
-        io::{self},
-        os::fd::FromRawFd,
+        fs::{self, create_dir_all, remove_dir_all, File},
+        io::{self, BufReader, Read, Write},
+        os::{
+            fd::FromRawFd,
+            unix::net::{UnixListener, UnixStream},
+        },
+
         path::PathBuf,
+        sync::mpsc::{self, Receiver},
+        thread::{self, JoinHandle},
     };
 
     use nix::{
+        errno::Errno,
         fcntl::OFlag,
-        libc::STDOUT_FILENO,
+        libc::{STDERR_FILENO, STDOUT_FILENO},
         sched::{clone, CloneFlags},
-        sys::wait::{waitpid, WaitStatus},
-        unistd::{chroot, close, dup2, execv, pipe2},
+        sys::{
+            signal::{kill, Signal},
+            wait::{waitpid, WaitStatus},
+        },
+        unistd::{chroot, close, dup2, execv, pipe2, Pid},
     };
+    use serde::{Deserialize, Serialize};
     use tar::Archive;
     use tracing::error;
     use uuid::Uuid;
 
     pub struct Sandbox {
         id: String,
-        path: PathBuf,
+        base_path: PathBuf,
+        root_path: PathBuf,
+        control_path: PathBuf,
+
+        shim_pid: Option<Pid>,
+        request_pipe: Option<File>,
+        response_pipe: Option<File>,
+
+        reader_thread: Option<JoinHandle<()>>,
+    }
+
+    impl Sandbox {
+        pub fn get_root_path(&self) -> PathBuf {
+            return self.root_path.clone();
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    enum ShimCommand {
+        Exit,
+        Ping,
+        Run { path: PathBuf, args: Option<String> },
     }
 
     #[derive(Debug)]
     pub enum Error {
         OsError(nix::Error),
+        Custom(String),
     }
     impl Display for Error {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
                 Error::OsError(e) => write!(f, "OS error: {}", e),
+                Error::Custom(e) => write!(f, "Unknown: {}", e),
             }
         }
     }
@@ -541,63 +555,204 @@ mod sandbox {
     impl Sandbox {
         pub fn new(base_path: &PathBuf) -> Result<Self, Error> {
             let id = format!("sandbox.{}", Uuid::new_v4());
-            let path = base_path.join(PathBuf::from(id.clone()));
+            let base_path = base_path.join(PathBuf::from(id.clone()));
+            let root_path = base_path.join(PathBuf::from("root"));
+            let control_path = root_path.join(PathBuf::from("control.sock"));
+            let mut sandbox = Sandbox {
+                id,
+                base_path: base_path.clone(),
+                root_path: root_path.clone(),
+                control_path: control_path.clone(),
+                shim_pid: None,
+                request_pipe: None,
+                response_pipe: None,
+                reader_thread: None,
+            };
 
-            create_dir_all(&path).expect("Cannot initiate sandbox. Failed to create directory");
+            // create base structure
+            Self::create_base_structure(&root_path).unwrap();
 
-            let file = File::open("/tmp/linux-av/distrobox.tar")
-                .expect("Distrobox not found. Check your installation");
-            Archive::new(file)
-                .unpack(&path)
-                .expect("Cannot unpack base system into sandbox filesystem");
+            // create shim
+            let shim_pid = sandbox.create_shim().unwrap();
 
-            create_dir_all(path.join("monitor")).expect("Failed to create monitor directory");
+            sandbox.shim_pid = Some(shim_pid);
 
-            Ok(Sandbox { id, path })
+            Ok(sandbox)
         }
-        pub async fn run(&self, path: &PathBuf, args: Option<String>) -> Result<(), Error> {
+
+        pub fn run(
+            &self,
+            program: &PathBuf,
+            args: Option<String>,
+        ) -> Result<(Receiver<Vec<u8>>, Receiver<Vec<u8>>), Error> {
+            let path = PathBuf::from("/tmp").join(program.file_name().unwrap());
+            let full_path = self
+                .root_path
+                .join("tmp")
+                .join(program.file_name().unwrap());
+            fs::copy(program, &full_path).expect("Failed to copy program to launch path");
+
+            let mut conn =
+                UnixStream::connect(self.control_path.clone()).expect("Client cannot send request");
+
+            let request = ShimCommand::Run { path, args };
+
+            serde_json::to_writer(&conn, &request).unwrap();
+
+            let (tx_stdout, rx_stdout) = mpsc::channel::<Vec<u8>>();
+            let (tx_stderr, rx_stderr) = mpsc::channel::<Vec<u8>>();
+            thread::spawn(move || {
+                let mut buffer = [0; 1024];
+                while let Ok(n) = conn.read(&mut buffer) {
+                    if n == 0 {
+                        break;
+                    }
+                    // Send a new Vec<u8> with the data
+                    tx_stdout.send(buffer[..n].to_vec()).unwrap();
+                }
+            })
+            .join()
+            .unwrap();
+
+            Ok((rx_stdout, rx_stderr))
+        }
+
+        pub fn delete(&self) -> Result<(), io::Error> {
+            if let Some(pid) = self.shim_pid {
+                kill(pid, Signal::SIGKILL).unwrap();
+            }
+            remove_dir_all(self.base_path.clone())
+        }
+
+        fn create_shim(&self) -> Result<Pid, Error> {
             let stack_size = 1024 * 1024;
             let mut stack: Vec<u8> = vec![0; stack_size];
 
-            let clone_flags =
-                CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWNS;
+            let clone_flags = CloneFlags::CLONE_NEWUSER
+                | CloneFlags::CLONE_NEWNET
+                | CloneFlags::CLONE_NEWPID
+                | CloneFlags::CLONE_NEWUTS
+                | CloneFlags::CLONE_NEWNS;
 
-            let pipe_stdout = pipe2(OFlag::O_DIRECT | OFlag::O_CLOEXEC).unwrap();
-            let pipe_stderr = pipe2(OFlag::O_DIRECT | OFlag::O_CLOEXEC).unwrap();
-
-            let stdout_path = self.path.join("monitor").join("stdout");
-            let stderr_path = self.path.join("monitor").join("stderr");
-            let monitor_handle = tokio::spawn(async move {
-                close(pipe_stdout.1).unwrap();
-                close(pipe_stderr.1).unwrap();
-                write_raw_fd(&stdout_path, pipe_stdout.0).unwrap();
-                write_raw_fd(&stderr_path, pipe_stderr.0).unwrap();
-            });
             let child = clone(
                 Box::new(|| {
-                    if let Err(e) = chroot(&self.path) {
+                    let listener = UnixListener::bind(self.control_path.clone()).unwrap();
+                    if let Err(e) = chroot(&self.root_path) {
                         error!("Error changing root: {:?}", e);
                         return -1;
                     }
                     std::env::set_current_dir("/").unwrap();
 
-                    // Prepare the program and arguments to execute
-                    let c_program = CString::new(path.to_str().unwrap())
+                    loop {
+                        match listener.accept() {
+                            Ok((mut conn, _)) => {
+                                let mut request = serde_json::Deserializer::from_reader(&conn);
+                                match ShimCommand::deserialize(&mut request) {
+                                    Ok(cmd) => match cmd {
+                                        ShimCommand::Run { path, args } => {
+                                            let stdout = pipe2(OFlag::O_CLOEXEC).unwrap();
+                                            let stderr = pipe2(OFlag::O_CLOEXEC).unwrap();
+                                            match self.run_process(&path, args, stdout, stderr) {
+                                                Ok(_) => {
+                                                    let mut stdout_reader =
+                                                        BufReader::new(unsafe {
+                                                            File::from_raw_fd(stdout.0)
+                                                        });
+
+                                                    let mut stdout_buffer = [0; 1024];
+
+                                                    loop {
+                                                        match stdout_reader
+                                                            .read(&mut stdout_buffer)
+                                                            .unwrap()
+                                                        {
+                                                            0 => break,
+                                                            n => conn
+                                                                .write_all(&stdout_buffer[..n])
+                                                                .unwrap(),
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    println!("process not exited correctly {:?}", e)
+                                                }
+                                            };
+                                        }
+                                        ShimCommand::Exit => {
+                                            println!("Shim: exit command recvd");
+                                            break;
+                                        }
+                                        ShimCommand::Ping => {
+                                            println!("Shim: ping command recvd");
+                                        }
+                                    },
+                                    Err(e) => {
+                                        error!("cannot deserialize command {}", e)
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("cannot accept connection {}", e);
+                                break;
+                            }
+                        };
+                    }
+                    0
+                }),
+                &mut stack,
+                clone_flags,
+                Some(nix::libc::SIGCHLD),
+            )
+            .unwrap();
+
+            loop {
+                match UnixStream::connect(self.control_path.clone()) {
+                    Ok(socket) => {
+                        serde_json::to_writer(socket, &ShimCommand::Ping).unwrap();
+                        break;
+                    }
+                    Err(_) => {}
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+
+            Ok(child)
+        }
+
+        fn run_process(
+            &self,
+            program: &PathBuf,
+            args: Option<String>,
+            (stdout_read, stdout_write): (i32, i32),
+            (stderr_read, stderr_write): (i32, i32),
+        ) -> Result<(), Errno> {
+            let stack_size = 1024 * 1024;
+            let mut stack: Vec<u8> = vec![0; stack_size];
+
+            let clone_flags = CloneFlags::CLONE_IO | CloneFlags::CLONE_FS;
+            let child = clone(
+                Box::new(|| {
+                    // Redirect stdout
+                    dup2(stdout_write, STDOUT_FILENO).unwrap();
+                    close(stdout_write).unwrap(); // Close write end after dup2
+
+                    // Redirect stderr
+                    dup2(stderr_write, STDERR_FILENO).unwrap();
+                    close(stderr_write).unwrap(); // Close write end after dup2
+
+                    close(stdout_read).unwrap(); // Close read end in child
+                    close(stderr_read).unwrap();
+
+                    let executable = CString::new(program.to_str().unwrap())
                         .expect("Error converting program path");
 
-                    // Execute the specified program
-                    let mut args = match &args {
-                        Some(args) => args
-                            .split_whitespace()
-                            .map(|s| CString::new(s).unwrap())
-                            .collect(),
-                        None => vec![],
+                    let args_vec: Vec<CString> = match &args {
+                        Some(arg_string) => {
+                            vec![executable, CString::new(arg_string.to_string()).unwrap()]
+                        }
+                        None => vec![executable],
                     };
-                    args.insert(0, c_program);
-                    close(STDOUT_FILENO).unwrap();
-                    close(pipe_stdout.0).unwrap();
-                    dup2(pipe_stdout.1, STDOUT_FILENO).unwrap();
-                    match execv(&args[0], &args) {
+                    match execv(&args_vec[0], &args_vec) {
                         Ok(_) => 0,
                         Err(err) => {
                             error!("Error executing program: {:?}", err);
@@ -610,56 +765,75 @@ mod sandbox {
                 Some(nix::libc::SIGCHLD),
             );
 
-            let process_output = match child {
+            match child {
                 Ok(pid) => match waitpid(pid, None).unwrap() {
-                    WaitStatus::Exited(_, _) => Ok(()),
+                    WaitStatus::Exited(_, status) => match status {
+                        0 => {
+                            close(stdout_write).unwrap(); // Close write ends in parent
+                            close(stderr_write).unwrap(); // Close write ends in parent
+                            Ok(())
+                        }
+                        s => {
+                            println!("process exited with non-zero status {:?}", s);
+                            Err(Errno::from_i32(s))
+                        }
+                    },
                     WaitStatus::Signaled(_, _, _) => Ok(()),
                     _ => {
-                        error!("Process terminated in an unexpected way");
+                        println!("Process terminated in an unexpected way");
                         Ok(())
                     }
                 },
-                Err(e) => Err(Error::OsError(e)),
-            };
-
-            tokio::join!(monitor_handle).0.unwrap();
-            return process_output;
+                Err(e) => Err(e),
+            }
         }
-        pub fn delete(&self) -> Result<(), io::Error> {
-            remove_dir_all(self.path.clone())
-        }
-    }
 
-    impl Sandbox {
-        pub fn get_path(&self) -> PathBuf {
-            return self.path.clone();
-        }
-    }
+        fn create_base_structure(root_path: &PathBuf) -> Result<(), Error> {
+            create_dir_all(&root_path)
+                .expect("Cannot initiate sandbox. Failed to create directory");
 
-    fn write_raw_fd(dest: &PathBuf, fd: i32) -> Result<u64, io::Error> {
-        let f = unsafe { File::from_raw_fd(fd) };
-        let mut reader = io::BufReader::new(f);
-        let dest = File::create(dest).unwrap();
-        let mut writer = io::BufWriter::new(dest);
-        io::copy(&mut reader, &mut writer)
+            let file = File::open("/tmp/linux-av/busybox.tar")
+                .expect("Busybox not found. Check your installation");
+            Archive::new(file)
+                .unpack(&root_path)
+                .expect("Cannot unpack base system into sandbox filesystem");
+
+            create_dir_all(root_path.join("tmp")).expect("Failed to create tmp directory");
+            Ok(())
+        }
     }
 
     #[cfg(test)]
     mod test {
-        use std::path::PathBuf;
+        use std::{
+            fs::{File, Permissions},
+            io::Write,
+            os::unix::fs::PermissionsExt,
+            path::PathBuf,
+        };
 
         use crate::sandbox::Sandbox;
 
-        #[tokio::test]
-        async fn execute_simple_shell_command() {
-            let sandbox = Sandbox::new(&PathBuf::from("/tmp"));
-            assert!(sandbox.is_ok());
-            assert!(sandbox
-                .unwrap()
-                .run(&PathBuf::from("/bin/ls"), Some("-la".to_string()))
-                .await
-                .is_ok());
-            // assert_file_content(&sandbox.get_path().join(stdout_path), expected);
+        #[test]
+        fn execute_simple_shell_command() {
+            let script = r" 
+                #! /bin/sh
+                echo hello $1";
+
+            let sandbox = Sandbox::new(&PathBuf::from("/tmp")).expect("cannot create sandbox");
+            let script_path = sandbox.base_path.join("script.sh");
+            let mut f = File::create(script_path.clone()).unwrap();
+            f.write_all(script.trim().as_bytes()).unwrap();
+            f.set_permissions(Permissions::from_mode(0o777)).unwrap();
+
+            let result = sandbox.run(&script_path, Some("world".to_string()));
+
+            let result = result.unwrap().0;
+            let string = String::from_utf8(result.recv().unwrap()).unwrap();
+
+            assert_eq!(string, "hello world\n");
+
+            sandbox.delete().expect("Cannot delete sandbox");
         }
     }
 }
