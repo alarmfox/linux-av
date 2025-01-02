@@ -102,14 +102,14 @@ mod daemon {
 
     use std::{
         fs::{self, File},
-        io::{self, BufRead, BufReader, Cursor, Read, StdoutLock, Write},
+        io::{self, BufRead, BufReader, Cursor, Read, Write},
         os::unix::{fs::PermissionsExt, net::UnixListener},
         path::PathBuf,
         process,
-        sync::{mpsc::RecvError, Arc},
+        sync::Arc,
     };
 
-    use serde::{Deserialize, Serialize};
+    use serde::Deserialize;
     use sha2::{Digest, Sha256};
     use tempfile::tempfile;
     use tracing::{debug, error};
@@ -245,7 +245,7 @@ mod daemon {
                     version: self.version.clone(),
                 })),
                 Command::Run { path, args } => {
-                    let mut sandbox =
+                    let sandbox =
                         Sandbox::new(&self.config_path).map_err(Error::SandboxError)?;
                     let run_result = match sandbox.run(path, args.clone()) {
                         Ok((stdout, stderr)) => RunResult {
@@ -484,16 +484,13 @@ mod sandbox {
         ffi::CString,
         fmt::Display,
         fs::{self, create_dir_all, remove_dir_all, File},
-        io::{self, BufRead, BufReader, BufWriter, Read, Write},
+        io::{self, BufReader, Read, Write},
         os::{
             fd::FromRawFd,
             unix::net::{UnixListener, UnixStream},
         },
         path::PathBuf,
-        sync::{
-            mpsc::{self, Receiver},
-            Arc, Mutex,
-        },
+        sync::mpsc::{self, Receiver},
         thread::{self, JoinHandle},
     };
 
@@ -808,8 +805,8 @@ mod sandbox {
     mod test {
         use std::{
             fs::{File, Permissions},
-            io::{Read, Write},
-            os::{fd::FromRawFd, unix::fs::PermissionsExt},
+            io::Write,
+            os::unix::fs::PermissionsExt,
             path::PathBuf,
         };
 
